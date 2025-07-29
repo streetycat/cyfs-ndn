@@ -242,9 +242,16 @@ impl PackageEnv {
                 if  config_result.is_ok() {
                     env_config = config_result.unwrap();
                     is_dev_mode = false;
-                    info!("env load pkg.cfg.json OK.");
+                    info!("pkg_env load pkg.cfg.json OK.");
+                    if env_config.parent.is_some() {
+                        if env_config.parent.as_ref().unwrap().starts_with(".") {
+                            let parent_path = work_dir.join(env_config.parent.as_ref().unwrap());
+                            info!("pkg_env parent abs path: {}", parent_path.display());
+                            env_config.parent = Some(parent_path);
+                        } 
+                    }
                 } else {
-                    info!("env load pkg.cfg.json failed. {}",config_result.err().unwrap());
+                    info!("pkg_env load pkg.cfg.json failed. {}",config_result.err().unwrap());
                 }
             }
         } 
