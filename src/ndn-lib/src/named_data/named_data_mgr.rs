@@ -492,7 +492,11 @@ impl NamedDataMgr {
 
     pub async fn is_chunk_exist_impl(&self, chunk_id: &ChunkId) -> NdnResult<bool> {
         for local_store in self.local_store_list.iter() {
-            let (is_exist, chunk_size) = local_store.is_chunk_exist(chunk_id, None).await?;
+            let query_result = local_store.is_chunk_exist(chunk_id, None).await;
+            if query_result.is_err() {
+                continue;
+            }
+            let (is_exist, chunk_size) = query_result.unwrap();
             if is_exist {
                 return Ok(true);
             }
@@ -895,13 +899,59 @@ impl NamedDataMgr {
     }
 
     pub async fn pub_local_file_as_chunk(
-        mgr_id: Option<&str>,
-        local_file_path: String,
-        ndn_path: &str,
+        self,
+        local_file_path: &PathBuf,
         user_id: &str,
         app_id: &str,
-    ) -> NdnResult<()> {
-        unimplemented!()
+    ) -> NdnResult<ChunkId> {
+        //TODO：优化，边算边传，支持断点续传
+        debug!(
+            "start pub pub_local_file_as_chunk, local_file_path:{}",
+            local_file_path.display()
+        );
+        let mut file_reader = tokio::fs::File::open(local_file_path).await.map_err(|e| {
+            error!("open local_file_path failed, err:{}", e);
+            NdnError::IoError(format!("open local_file_path failed, err:{}", e))
+        })?;
+        debug!("open local_file_path success");
+        let mut chunk_hasher = ChunkHasher::new(None).unwrap();
+        let chunk_type = chunk_hasher.hash_method.clone();
+
+        file_reader.seek(SeekFrom::Start(0)).await;
+        let (chunk_raw_id, chunk_size) = chunk_hasher
+            .calc_from_reader(&mut file_reader)
+            .await
+            .unwrap();
+
+        let chunk_id = ChunkId::from_mix_hash_result_by_hash_method(chunk_size, &chunk_raw_id, chunk_type)?;
+        info!(
+            "pub_local_file_as_fileobj:calc chunk_id success,chunk_id:{},chunk_size:{}",
+            chunk_id.to_string(),
+            chunk_size
+        );
+
+        let is_exist = self.is_chunk_exist_impl(&chunk_id).await.unwrap();
+        if !is_exist {
+            let (mut chunk_writer, _) = self
+                .open_chunk_writer_impl(&chunk_id, chunk_size, 0)
+                .await?;
+
+            file_reader.seek(std::io::SeekFrom::Start(0)).await.unwrap();
+            let copy_bytes = tokio::io::copy(&mut file_reader, &mut chunk_writer)
+                .await
+                .map_err(|e| {
+                    error!(
+                        "copy local_file {:?} to named-mgr failed, err:{}",
+                        local_file_path, e
+                    );
+                    NdnError::IoError(format!("copy local_file to named-mgr failed, err:{}", e))
+                })?;
+
+            info!("pub_local_file_as_fileobj:copy local_file {:?} to named-mgr's chunk success,copy_bytes:{}", local_file_path, copy_bytes);
+       
+            self.complete_chunk_writer_impl(&chunk_id).await?;
+        }
+        Ok(chunk_id)
     }
 }
 
