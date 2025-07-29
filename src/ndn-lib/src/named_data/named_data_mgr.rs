@@ -64,27 +64,15 @@ impl NamedDataMgr {
         Ok(())
     }
 
-    pub async fn get_named_data_mgr_by_id(
-        named_data_mgr_id: Option<&str>,
-    ) -> Option<Arc<tokio::sync::Mutex<Self>>> {
-        let named_mgr_key = named_data_mgr_id.unwrap_or("default").to_string();
-        let mut named_data_mgr_map = NAMED_DATA_MGR_MAP.lock().await;
-
-        let named_data_mgr = named_data_mgr_map.get(&named_mgr_key);
-        if named_data_mgr.is_some() {
-            debug!("NamedDataMgr: get named data mgr by id:{}", named_mgr_key);
-            return Some(named_data_mgr.unwrap().clone());
-        }
-
-        info!(
-            "NamedDataMgr: auto create new named data mgr for mgr_id:{}",
-            named_mgr_key
-        );
-        let root_path = get_buckyos_named_data_dir(named_mgr_key.as_str());
-        //make sure the root path dir exists
+    pub async fn get_named_data_mgr_by_path(
+        root_path: PathBuf,
+    ) -> NdnResult<NamedDataMgr> {
         if !root_path.exists() {
             fs::create_dir_all(root_path.clone()).await.unwrap();
         }
+        //mgrid is the dir name of root_path
+        let mgr_id = root_path.file_name().unwrap().to_str().unwrap().to_string();
+
         let mgr_config;
         let mgr_json_file = root_path.join("ndn_mgr.json");
         if !mgr_json_file.exists() {
@@ -107,7 +95,7 @@ impl NamedDataMgr {
                     "NamedDataMgr: read mgr config failed! {}",
                     mgr_json_str.err().unwrap().to_string()
                 );
-                return None;
+                return Err(NdnError::NotFound(format!("named data mgr not found")));
             }
             let mgr_json_str = mgr_json_str.unwrap();
             let mgr_config_result = serde_json::from_str::<NamedDataMgrConfig>(&mgr_json_str);
@@ -116,17 +104,40 @@ impl NamedDataMgr {
                     "NamedDataMgr: parse mgr config failed! {}",
                     mgr_config_result.err().unwrap().to_string()
                 );
-                return None;
+                return Err(NdnError::NotFound(format!("named data mgr not found")));
             }
             mgr_config = mgr_config_result.unwrap();
         }
 
-        let result_mgr = Self::from_config(
-            named_data_mgr_id.map(|s| s.to_string()),
+        Self::from_config(
+            Some(mgr_id),
             root_path,
             mgr_config,
         )
-        .await;
+        .await
+    }
+
+    pub async fn get_named_data_mgr_by_id(
+        named_data_mgr_id: Option<&str>,
+    ) -> Option<Arc<tokio::sync::Mutex<Self>>> {
+        let named_mgr_key = named_data_mgr_id.unwrap_or("default").to_string();
+        let mut named_data_mgr_map = NAMED_DATA_MGR_MAP.lock().await;
+
+        let named_data_mgr = named_data_mgr_map.get(&named_mgr_key);
+        if named_data_mgr.is_some() {
+            debug!("NamedDataMgr: get named data mgr by id:{}", named_mgr_key);
+            return Some(named_data_mgr.unwrap().clone());
+        }
+
+        info!(
+            "NamedDataMgr: auto create new named data mgr for mgr_id:{}",
+            named_mgr_key
+        );
+        let root_path = get_buckyos_named_data_dir(named_mgr_key.as_str());
+        //make sure the root path dir exists
+  
+        let result_mgr = Self::get_named_data_mgr_by_path(root_path).await;
+    
         if result_mgr.is_err() {
             warn!(
                 "NamedDataMgr: create mgr failed! {}",
