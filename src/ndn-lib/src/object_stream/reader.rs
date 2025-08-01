@@ -1,10 +1,14 @@
 use tokio::sync::mpsc::Receiver;
 
-use crate::{types::LineIndex, NdnResult};
+use crate::{
+    types::{LineIndex, LineIndexWithRelation},
+    NdnResult,
+};
 
 #[async_trait::async_trait]
 pub trait Reader {
-    async fn next_line(&mut self) -> NdnResult<Option<(crate::types::Line, LineIndex)>>;
+    async fn next_line(&mut self)
+        -> NdnResult<Option<(crate::types::Line, LineIndexWithRelation)>>;
     async fn line_at(
         &mut self,
         index: LineIndex,

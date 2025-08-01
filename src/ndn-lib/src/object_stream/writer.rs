@@ -1,4 +1,4 @@
-use crate::types::LineIndex;
+use crate::types::LineIndexWithRelation;
 
 #[async_trait::async_trait]
 pub trait Writer {
@@ -8,6 +8,6 @@ pub trait Writer {
     async fn write_line(
         &mut self,
         line: crate::types::Line,
-        line_index: LineIndex,
+        line_index: LineIndexWithRelation,
     ) -> crate::NdnResult<()>;
 }
