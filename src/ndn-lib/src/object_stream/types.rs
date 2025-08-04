@@ -39,6 +39,10 @@ pub enum Line {
         header: Option<Value>,
         content: ObjMapLine,
     },
+    EndCheck {
+        indexes: Vec<LineIndex>,
+        ids: Vec<ObjId>,
+    }
 }
 
 pub enum ObjArrayLine {

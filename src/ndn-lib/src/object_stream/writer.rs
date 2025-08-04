@@ -1,4 +1,7 @@
-use crate::types::LineIndexWithRelation;
+use crate::{
+    types::{LineIndex, LineIndexWithRelation},
+    ObjId,
+};
 
 #[async_trait::async_trait]
 pub trait Writer {

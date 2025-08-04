@@ -2,8 +2,13 @@ use tokio::sync::mpsc::Receiver;
 
 use crate::{
     types::{LineIndex, LineIndexWithRelation},
-    NdnResult,
+    NdnResult, ObjId,
 };
+
+pub enum EndReason {
+    Abort,
+    Complete,
+}
 
 #[async_trait::async_trait]
 pub trait Reader {
@@ -20,4 +25,7 @@ pub trait Reader {
         for_index: LineIndex,
         waiter: Option<Receiver<NdnResult<Option<crate::types::Line>>>>,
     ) -> NdnResult<()>;
+    async fn ignore(&mut self, index: LineIndex) -> NdnResult<()>;
+    async fn ignore_by_id(&mut self, id: ObjId) -> NdnResult<()>;
+    async fn end(&mut self, reason: EndReason) -> NdnResult<()>;
 }
