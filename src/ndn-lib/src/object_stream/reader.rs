@@ -27,5 +27,18 @@ pub trait Reader {
     ) -> NdnResult<()>;
     async fn ignore(&mut self, index: LineIndex) -> NdnResult<()>;
     async fn ignore_by_id(&mut self, id: ObjId) -> NdnResult<()>;
-    async fn end(&mut self, reason: EndReason) -> NdnResult<()>;
+    async fn end(self, reason: EndReason) -> NdnResult<()>;
+}
+
+#[async_trait::async_trait]
+pub trait ReaderListener {
+    async fn wait(&mut self) -> NdnResult<ReaderEvent>;
+}
+
+pub enum ReaderEvent {
+    NeedLine(Vec<LineIndex>),
+    NeedObject(Vec<(ObjId, LineIndex)>),
+    IgnoreLine(Vec<LineIndex>),
+    IgnoreObject(Vec<ObjId>),
+    End(EndReason),
 }

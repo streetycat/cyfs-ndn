@@ -16,15 +16,6 @@ pub enum LineIndexWithRelation {
 }
 
 pub enum Line {
-    Index {
-        obj_start_index: LineIndex,
-        obj_ids: Vec<ObjId>,
-    },
-    ObjHeader {
-        obj_index: LineIndex,
-        id: ObjId,
-        header: Value,
-    },
     Obj {
         id: ObjId,
         obj: Value,
@@ -39,16 +30,35 @@ pub enum Line {
         header: Option<Value>,
         content: ObjMapLine,
     },
+    Index {
+        obj_start_index: LineIndex,
+        obj_ids: Vec<ObjId>,
+    },
+    ObjHeader {
+        obj_index: LineIndex,
+        id: ObjId,
+        header: Value,
+    },
+    StreamHeader {
+        app: Option<AppInfo>,
+        provider_url: Option<String>,
+    },
     EndCheck {
         indexes: Vec<LineIndex>,
+        ranges: Vec<Range<LineIndex>>,
         ids: Vec<ObjId>,
-    }
+    },
+}
+
+pub enum ObjArraySubObjIndex {
+    Index(LineIndex),
+    Range(Range<LineIndex>),
 }
 
 pub enum ObjArrayLine {
     Memory(Vec<ObjId>),
     File(PathBuf),
-    Stream(Vec<LineIndex>),
+    Lines(Vec<ObjArraySubObjIndex>),
     Diff {
         base_array: ObjId,
         actions: Vec<ObjArrayDiffAction>,
@@ -113,4 +123,9 @@ pub enum ObjMapDiffAction {
     SetMultipleWithIndex(HashMap<String, LineIndex>),
     Remove(String),
     RemoveMultiple(HashSet<String>),
+}
+
+pub struct AppInfo {
+    pub id: ObjId,
+    pub name: String,
 }
