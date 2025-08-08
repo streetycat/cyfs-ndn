@@ -1,3 +1,4 @@
+mod demo;
 pub mod protocol;
 mod reader;
 pub mod types;

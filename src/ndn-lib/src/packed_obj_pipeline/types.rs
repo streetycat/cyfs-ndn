@@ -39,7 +39,7 @@ pub enum Line {
         id: ObjId,
         header: Value,
     },
-    StreamHeader {
+    Header {
         app: Option<AppInfo>,
         provider_url: Option<String>,
     },

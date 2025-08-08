@@ -13,7 +13,7 @@ mod object_map;
 mod trie_object_map;
 mod object_array;
 mod coll;
-mod object_stream;
+mod packed_obj_pipeline;
 
 pub use object::*;
 pub use chunk::*;
@@ -28,7 +28,7 @@ pub use object_map::*;
 pub use trie_object_map::*;
 pub use object_array::*;
 pub use coll::*;
-pub use object_stream::*;
+pub use packed_obj_pipeline::*;
 
 use reqwest::StatusCode;
 use thiserror::Error;

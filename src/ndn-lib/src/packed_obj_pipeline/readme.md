@@ -17,25 +17,23 @@
 4. 源设备最后应该发送一个衡量同步完成的方法
     * 某个/某些指定的对象在目标设备上重建完成
 
-
-# ObjectStream
+# PackedObjPipeline
 
 对上述过程进行抽象，提供基础工具批量重建对象。
 
-1. 把所有对象按行存储/传输，每行独立语义，这是一个`Stream`，可能是个文件，也可能是个网络连接...。
+1. 把所有对象按行存储/传输，每行独立语义，这是一个`Pipeline`，可能是个文件，也可能是个网络连接...。
 2. 逐行赋予一个顺次递增的`Index`，但可以不按顺序写入或读出。
 3. 除了顺序读取，还可以读取指定`Index`的行，也可以读取指定`ObjId`的对象。
-4. 一个`Stream`应该定义明确的重建成功的规则，通常是某些特定`ObjId`的对象成功构造。
-5. 一个`Stream`如果包含了其重建所需的所有条件(子对象)，则通过读取这个`Stream`即可完成重建，这是一个完备的`Stream`；
-   如果这个`Stream`需要依赖特定应用才能完成重建，它应该指定明确的`AppId`;
-   如果这个`Stream`需要额外依赖其构造者设备上的某些状态，则应该指定一个`provider_url`。
+5. 一个`Pipeline`如果包含了其重建所需的所有条件(子对象)，则通过读取这个`Pipeline`即可完成重建，这是一个完备的`Pipeline`；
+   如果这个`Pipeline`需要依赖特定应用才能完成重建，它应该指定明确的`AppId`;
+   如果这个`Pipeline`需要额外依赖其构造者设备上的某些状态，则应该指定一个`provider_url`。
 
-## 跨端的ObjectStream
+## 跨端的ObjectPipeline
 
-以最前面目录同步为场景，`Stream`的`Reader`应该能给`Writer`适当的反馈，以调整`write`的顺序，甚至忽略部分内容。
+以最前面目录同步为场景，`Pipeline`的`Reader`应该能给`Writer`适当的反馈，以调整`write`的顺序，甚至忽略部分内容。
 
 ## 细节优化:
 
 1. cache:
     * 在内存缓存若干可能要马上传输的Chunk，避免反复从磁盘读取。
-2. ObjId比较大，必要时候使用`ObjectStream.line_index`在网络上交换信息，甚至通过`Range<LineIndex>`来批量表达对象
+2. ObjId比较大，必要时候使用`ObjectPipeline.line_index`在网络上交换信息，甚至通过`Range<LineIndex>`来批量表达对象

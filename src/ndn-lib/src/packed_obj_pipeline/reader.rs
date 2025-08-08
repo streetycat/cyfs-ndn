@@ -17,14 +17,20 @@ pub trait Reader {
     async fn line_at(
         &mut self,
         index: LineIndex,
+        offset: Option<u64>,
         waiter: Option<Receiver<NdnResult<Option<crate::types::Line>>>>,
     ) -> NdnResult<()>;
     async fn object_by_id(
         &mut self,
         id: &crate::ObjId,
         for_index: LineIndex,
+        offset: Option<u64>,
         waiter: Option<Receiver<NdnResult<Option<crate::types::Line>>>>,
     ) -> NdnResult<()>;
+}
+
+#[async_trait::async_trait]
+pub trait WriterFeedback {
     async fn ignore(&mut self, index: LineIndex) -> NdnResult<()>;
     async fn ignore_by_id(&mut self, id: ObjId) -> NdnResult<()>;
     async fn end(self, reason: EndReason) -> NdnResult<()>;
