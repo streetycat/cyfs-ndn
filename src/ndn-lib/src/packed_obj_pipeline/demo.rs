@@ -50,7 +50,13 @@ use tokio::sync::oneshot;
 
 use serde_json::Value;
 
-use crate::{packed_obj_pipeline::demo::{dir_backup::{DirObject, NdnReader, StorageItemName}, dir_restore::ChildInfo}, ChunkId, FileObject, NdnResult, ObjId, OBJ_TYPE_DIR, OBJ_TYPE_FILE};
+use crate::{
+    packed_obj_pipeline::demo::{
+        dir_backup::{DirObject, NdnReader, StorageItemName},
+        dir_restore::ChildInfo,
+    },
+    ChunkId, FileObject, NdnResult, ObjId, OBJ_TYPE_DIR, OBJ_TYPE_FILE,
+};
 
 // The index of a line in the object pipeline.
 // It is a 64-bit unsigned integer, which allows for a large number of lines.
@@ -345,7 +351,7 @@ pub enum EndReason {
 
 #[async_trait::async_trait]
 pub trait Reader {
-    async fn next_line(&mut self) -> NdnResult<(Line, LineIndexWithRelation)>;
+    async fn next_line(&mut self) -> NdnResult<Option<(Line, LineIndexWithRelation)>>;
     async fn line_at(
         &mut self,
         index: LineIndex,
@@ -940,7 +946,7 @@ mod pipeline_sim {
 
     #[async_trait::async_trait]
     impl Reader for SimReader {
-        async fn next_line(&mut self) -> NdnResult<(Line, LineIndexWithRelation)> {
+        async fn next_line(&mut self) -> NdnResult<Option<(Line, LineIndexWithRelation)>> {
             loop {
                 {
                     let mut guard = self.inner.lock().await;
@@ -1035,7 +1041,7 @@ mod pipeline_sim {
                                 // no waker needed
                             }
                         }
-                        return Ok(item);
+                        return Ok(Some(item));
                     }
                     if guard.end_reason.is_some() {
                         // Signal end with an empty rebuild line
@@ -1477,13 +1483,15 @@ mod dir_backup {
     pub trait FileSystemWriter<W: FileSystemFileWriter>: Send + Sync + Sized {
         async fn create_dir_all(&self, dir_path: &Path) -> NdnResult<()>;
         async fn create_dir(&self, dir: &DirObject, parent_path: &Path) -> NdnResult<()>;
-        async fn open_file(&self, file: &FileObject, parent_path: &Path) -> NdnResult<W>;
+        async fn open_file(&self, file_path: &Path) -> NdnResult<W>;
     }
 
     #[async_trait::async_trait]
     pub trait FileSystemFileWriter: Send + Sync + Sized {
         async fn length(&self) -> NdnResult<u64>;
         async fn write_chunk(&self, chunk_data: &[u8], offset: SeekFrom) -> NdnResult<()>;
+        async fn truncate(&self, offset: SeekFrom) -> NdnResult<()>;
+        async fn read_chunk(&self, offset: SeekFrom, limit: u64) -> NdnResult<Vec<u8>>;
     }
 
     #[async_trait::async_trait]
@@ -2137,9 +2145,25 @@ mod dir_backup {
 }
 
 mod dir_restore {
-    use std::path::PathBuf;
+    use std::{
+        fs,
+        io::SeekFrom,
+        path::{Path, PathBuf},
+    };
 
-    use crate::{packed_obj_pipeline::demo::{dir_backup::{ItemSelectKey, StorageItemName}, Line, LineIndex}, NdnResult, ObjId};
+    use crate::{
+        chunk, copy_chunk,
+        packed_obj_pipeline::demo::{
+            dir_backup::{
+                ContainerLineIndex, DirObject, FileSystemFileWriter, FileSystemWriter,
+                ItemSelectKey, NdnReader, StorageItemName,
+            },
+            CollectionHeader, Line, LineIndex, LineIndexWithRelation, ObjArrayLine,
+            ObjArraySubObjIndex, ObjMapLine, Reader,
+        },
+        ChunkHasher, ChunkListBuilder, FileObject, NdnError, NdnResult, ObjId, OBJ_TYPE_DIR,
+        OBJ_TYPE_FILE,
+    };
 
     pub enum RestoreItemStatus {
         New,
@@ -2148,8 +2172,69 @@ mod dir_restore {
         Complete(PathBuf),
     }
 
+    impl RestoreItemStatus {
+        pub fn check_check_hashing(&self) {
+            match self {
+                RestoreItemStatus::New => {
+                    unreachable!("expect item to be in CheckHashing status, got New status");
+                }
+                RestoreItemStatus::CheckHashing => {
+                    // nothing to do here
+                }
+                RestoreItemStatus::Transfer(_) => {
+                    unreachable!("expect item to be in CheckHashing status, got Transfer status");
+                }
+                RestoreItemStatus::Complete(path) => {
+                    unreachable!(
+                        "expect item to be in CheckHashing status, got Complete status: {}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        pub fn check_transfer(&self) -> &Path {
+            match self {
+                RestoreItemStatus::New => {
+                    unreachable!("expect item to be in Transfer status, got New status");
+                }
+                RestoreItemStatus::CheckHashing => {
+                    unreachable!("expect item to be in Transfer status, got CheckHashing status");
+                }
+                RestoreItemStatus::Transfer(path) => path,
+                RestoreItemStatus::Complete(path) => {
+                    unreachable!("expect item to be in Transfer status, got Complete status");
+                }
+            }
+        }
+
+        pub fn check_complete(&self) -> &Path {
+            match self {
+                RestoreItemStatus::New => {
+                    unreachable!("expect item to be in Complete status, got New status");
+                }
+                RestoreItemStatus::CheckHashing => {
+                    unreachable!("expect item to be in Complete status, got CheckHashing status");
+                }
+                RestoreItemStatus::Transfer(_) => {
+                    unreachable!("expect item to be in Complete status, got Transfer status");
+                }
+                RestoreItemStatus::Complete(path) => path,
+            }
+        }
+
+        pub fn save_path(&self) -> Option<&Path> {
+            match self {
+                RestoreItemStatus::New => None,
+                RestoreItemStatus::CheckHashing => None,
+                RestoreItemStatus::Transfer(path) => Some(path),
+                RestoreItemStatus::Complete(path) => Some(path),
+            }
+        }
+    }
+
     pub struct LineStorageItem<IT> {
         pub item_id: IT,
+        pub fs_item_id: Option<IT>,
         pub line: Option<(Line, LineIndex)>,
         pub header_line: Option<(Line, LineIndex)>,
         pub obj_id: Option<ObjId>,
@@ -2157,16 +2242,16 @@ mod dir_restore {
         pub status: RestoreItemStatus,
     }
 
-    pub struct ChildInfo {
+    pub struct ChildInfo<IT> {
         pub name: Option<StorageItemName>,
         pub child_line_index: Option<LineIndex>,
         pub child_obj_id: Option<ObjId>,
-        pub child_item_id: Option<Self::ItemId>,
+        pub child_item_id: Option<IT>,
     }
 
     #[async_trait::async_trait]
-    pub trait RestoreStorage {
-        type ItemId: Clone + Send + Sync + 'static;
+    pub trait RestoreStorage: Clone + Send + Sync {
+        type ItemId: std::fmt::Debug + Clone + Send + Sync + 'static;
 
         async fn create_new_line_item(
             &self,
@@ -2178,8 +2263,8 @@ mod dir_restore {
         async fn add_children(
             &self,
             parent_item_id: Option<&Self::ItemId>, // None for root item
-            children: &[ChildInfo],
-        ) -> NdnResult<()>;
+            children: &[ChildInfo<Self::ItemId>],
+        ) -> NdnResult<Self::ItemId>;
 
         async fn begin_transfer(
             &self,
@@ -2187,20 +2272,15 @@ mod dir_restore {
             save_path: &Path,
         ) -> NdnResult<Option<ContainerLineIndex>>;
 
-        async fn complete(
-            &self,
-            key: &ItemSelectKey<Self::ItemId>,
-        ) -> NdnResult<()>;
+        async fn complete(&self, key: &ItemSelectKey<Self::ItemId>) -> NdnResult<()>;
 
-        async fn set_transfer_to_complete_with_all_children_complete(
-            &self,
-        ) -> NdnResult<u64>; // changed lines count
+        async fn set_transfer_to_complete_with_all_children_complete(&self) -> NdnResult<u64>; // changed lines count
 
         async fn select_children_check_hashing_with_parent_transfer(
             &self,
             offset: Option<u64>,
             limit: Option<u64>,
-        ) -> NdnResult<Vec<LineStorageItem<Self::ItemId>>>;
+        ) -> NdnResult<Vec<(LineStorageItem<Self::ItemId>, LineStorageItem<Self::ItemId>)>>; // <item, parent-item>
 
         async fn select_chunklist_transfer(
             &self,
@@ -2214,13 +2294,12 @@ mod dir_restore {
         async fn commit_transaction(&self) -> NdnResult<()>;
         async fn rollback_transaction(&self) -> NdnResult<()>;
     }
-        
-    }
+
     pub async fn ndn_to_file_system<
         S: RestoreStorage + 'static,
         FFW: FileSystemFileWriter + 'static,
         F: FileSystemWriter<FFW> + 'static,
-        PR: Reader + 'static,
+        PR: Reader + Clone + 'static,
         NR: NdnReader + 'static,
     >(
         dir_path_root_obj_id: Option<(&Path, &ObjId)>, // <root-path, root-obj-id>, None for continue
@@ -2229,6 +2308,26 @@ mod dir_restore {
         ndn_reader: NR,
         storage: S,
     ) -> NdnResult<S::ItemId> {
+        if let Some((path, root_obj_id)) = dir_path_root_obj_id {
+            info!(
+                "scan path: {}, root obj id: {}",
+                path.display(),
+                root_obj_id
+            );
+            writer.create_dir_all(path).await?;
+            storage
+                .add_children(
+                    None,
+                    &[ChildInfo {
+                        name: None,
+                        child_line_index: None,
+                        child_obj_id: Some(root_obj_id.clone()),
+                        child_item_id: None,
+                    }],
+                )
+                .await?;
+        }
+
         let pipeline_task_handle = {
             let dir_path_root_obj_id = dir_path_root_obj_id
                 .as_ref()
@@ -2238,9 +2337,7 @@ mod dir_restore {
             let read_pipeline = async move || -> NdnResult<()> {
                 info!("start ndn to file system task...");
 
-                let create_new_item = async |line: Line, line_index: LineIndex|
-                       -> NdnResult<()> {
-
+                let create_new_item = async |line: Line, line_index: LineIndex| -> NdnResult<()> {
                     /**
                      * 1. 把行添加进数据库
                      * 2. 如果这个行是个容器，把容器里的内容展开，把这些子对象和这个行建立父子关系
@@ -2281,10 +2378,12 @@ mod dir_restore {
                             // 3 / 4. 如果是文件或目录，解析其 content，加入一个子对象引用
                             let mut content_obj_id = None;
                             if id.obj_type.as_str() == OBJ_TYPE_FILE {
-                                let file_obj = serde_json::from_value::<FileObject>(obj) ?;
-                                 content_obj_id = Some(ObjId::try_from(file_obj.content.as_str())?);
+                                let file_obj = serde_json::from_value::<FileObject>(obj)
+                                    .map_err(|err| NdnError::DecodeError(err.to_string()))?;
+                                content_obj_id = Some(ObjId::try_from(file_obj.content.as_str())?);
                             } else if id.obj_type.as_str() == OBJ_TYPE_DIR {
-                                let dir_obj = serde_json::from_value::<DirObject>(obj)?;
+                                let dir_obj = serde_json::from_value::<DirObject>(obj)
+                                    .map_err(|err| NdnError::DecodeError(err.to_string()))?;
                                 content_obj_id = Some(ObjId::try_from(dir_obj.content.as_str())?);
                             }
 
@@ -2328,10 +2427,9 @@ mod dir_restore {
                                 ObjArrayLine::Memory(obj_list) => {
                                     let mut child_infos = Vec::with_capacity(obj_list.len());
                                     for seq in 0..obj_list.len() {
-                                        let obj_id = obj_list[seq];
-                                        let child_obj_id = ObjId::try_from(obj.content.as_str())?;
+                                        let child_obj_id = obj_list[seq];
                                         child_infos.push(ChildInfo {
-                                            name: Some(StorageItemName::ChunkSeq(seq)),
+                                            name: Some(StorageItemName::ChunkSeq(seq as u64)),
                                             child_line_index: None,
                                             child_obj_id: Some(child_obj_id),
                                             child_item_id: None,
@@ -2355,28 +2453,32 @@ mod dir_restore {
                                                     child_item_id: None,
                                                 });
                                                 next_seq += 1;
-                                            },
+                                            }
                                             ObjArraySubObjIndex::Range(range) => {
                                                 for child_index in range {
                                                     child_infos.push(ChildInfo {
-                                                        name: Some(StorageItemName::ChunkSeq(next_seq)),
+                                                        name: Some(StorageItemName::ChunkSeq(
+                                                            next_seq,
+                                                        )),
                                                         child_line_index: Some(child_index),
                                                         child_obj_id: None,
                                                         child_item_id: None,
                                                     });
                                                     next_seq += 1;
                                                 }
-                                            },
+                                            }
                                         }
-
                                     }
                                     child_infos
                                 }
-                                ObjArrayLine::Diff { base_array, actions } =>{
+                                ObjArrayLine::Diff {
+                                    base_array,
+                                    actions,
+                                } => {
                                     unimplemented!("ObjArrayLine::Diff not implemented in demo");
                                 }
                             };
-                            
+
                             if !child_infos.is_empty() {
                                 storage
                                     .add_children(Some(&item.item_id), &child_infos)
@@ -2409,7 +2511,7 @@ mod dir_restore {
                                     let mut child_infos = Vec::with_capacity(obj_map.len());
                                     for (key, obj_id) in obj_map.iter() {
                                         child_infos.push(ChildInfo {
-                                            name: Some(StorageItemName::Key(key.clone())),
+                                            name: Some(StorageItemName::Name(key.clone())),
                                             child_line_index: None,
                                             child_obj_id: Some(obj_id.clone()),
                                             child_item_id: None,
@@ -2424,26 +2526,30 @@ mod dir_restore {
                                     let mut child_infos = Vec::with_capacity(lines.len());
                                     for (key, sub_obj_index) in lines {
                                         child_infos.push(ChildInfo {
-                                            name: Some(StorageItemName::Key(key.clone())),
-                                            child_line_index: Some(child_index),
+                                            name: Some(StorageItemName::Name(key.clone())),
+                                            child_line_index: Some(sub_obj_index),
                                             child_obj_id: None,
                                             child_item_id: None,
                                         });
                                     }
                                     child_infos
                                 }
-                                ObjMapLine::Diff { base_map, actions } =>{
+                                ObjMapLine::Diff { base_map, actions } => {
                                     unimplemented!("ObjMapLine::Diff not implemented in demo");
                                 }
                             };
-                            
+
                             if !child_infos.is_empty() {
                                 storage
                                     .add_children(Some(&item.item_id), &child_infos)
                                     .await?;
                             }
                         }
-                        Line::ObjHeader { obj_index, id, header } => {
+                        Line::ObjHeader {
+                            obj_index,
+                            id,
+                            header,
+                        } => {
                             // 5. 头部行：以 header_line 方式存储
                             let _item = storage
                                 .create_new_line_item(
@@ -2474,223 +2580,326 @@ mod dir_restore {
                             // TODO: check root
                         }
                     }
-                    
-                    // let obj_value = reader.get_object(obj_id).await?;
-                    // if obj_id.obj_type.as_str() == OBJ_TYPE_DIR {
-                    //     let dir_obj: DirObject =
-                    //         serde_json::from_value(obj_value).map_err(|err| {
-                    //             let msg = format!(
-                    //                 "Failed to parse dir object from obj-id: {}, error: {}",
-                    //                 obj_id, err
-                    //             );
-                    //             error!("{}", msg);
-                    //             crate::NdnError::DecodeError(msg)
-                    //         })?;
-                    //     info!("create dir: {}, obj id: {}", dir_obj.name, obj_id);
-                    //     let (item_id, _, _) = storage
-                    //         .create_new_item(
-                    //             &StorageItem::Dir(dir_obj),
-                    //             depth,
-                    //             parent_path,
-                    //             parent_item_id,
-                    //         )
-                    //         .await?;
-                    //     storage.begin_transfer(&item_id, obj_id).await?;
-                    // } else if obj_id.obj_type.as_str() == OBJ_TYPE_FILE {
-                    //     let file_obj: FileObject =
-                    //         serde_json::from_value(obj_value).map_err(|err| {
-                    //             let msg = format!(
-                    //                 "Failed to parse file object from obj-id: {}, error: {:?}",
-                    //                 obj_id, err
-                    //             );
-                    //             error!("{}", msg);
-                    //             crate::NdnError::DecodeError(msg)
-                    //         })?;
-
-                    //     info!("create file: {}, obj id: {}", file_obj.name, obj_id);
-
-                    //     let (item_id, _, _) = storage
-                    //         .create_new_item(
-                    //             &StorageItem::File(FileStorageItem {
-                    //                 obj: file_obj,
-                    //                 chunk_size: None,
-                    //             }),
-                    //             depth,
-                    //             parent_path,
-                    //             parent_item_id,
-                    //         )
-                    //         .await?;
-                    //     storage.begin_transfer(&item_id, obj_id).await?;
-                    // } else {
-                    //     unreachable!(
-                    //         "expect dir or file object, got: {}, obj id: {}",
-                    //         obj_id.obj_type, obj_id
-                    //     );
-                    // }
 
                     Ok(())
                 };
-
-                let transfer_item = async |item_id: &S::ItemId,
-                                           item: &StorageItem,
-                                           parent_path: &Path,
-                                           depth: u64|
-                       -> NdnResult<()> {
-                    info!(
-                        "transfer item: {:?}, parent path: {}",
-                        item_id,
-                        parent_path.display()
-                    );
-                    match item {
-                        StorageItem::Dir(dir_obj) => {
-                            info!("transfer dir: {:?}", dir_obj.name);
-                            let dir_obj_map_id = ObjId::try_from(dir_obj.content.as_str())?;
-                            let obj_map_json = reader.get_container(&dir_obj_map_id).await?;
-                            let dir_obj_map = TrieObjectMap::open(obj_map_json).await?;
-
-                            writer.create_dir(dir_obj, parent_path).await?;
-
-                            let child_obj_ids = dir_obj_map
-                                .iter()?
-                                .map(|(_, child_obj_id)| child_obj_id)
-                                .collect::<Vec<_>>();
-                            for child_obj_id in child_obj_ids {
-                                create_new_item(
-                                    &parent_path.join(dir_obj.name.as_str()).as_path(),
-                                    &child_obj_id,
-                                    Some(item_id.clone()),
-                                    depth + 1,
-                                )
-                                .await?;
-                            }
-                            storage.complete(item_id).await?;
-                        }
-                        StorageItem::File(file_storage_item) => {
-                            info!("transfer file: {:?}", file_storage_item.obj.name);
-                            let file_chunk_list_id =
-                                ObjId::try_from(file_storage_item.obj.content.as_str())?;
-                            let chunk_list = reader.get_container(&file_chunk_list_id).await?;
-                            let chunk_list =
-                                ChunkListBuilder::open(chunk_list).await?.build().await?;
-
-                            let file_writer = writer
-                                .open_file(&file_storage_item.obj, parent_path)
-                                .await?;
-                            let file_length = file_writer.length().await?;
-                            let (chunk_index, mut pos) = if file_length > 0 {
-                                let (chunk_index, chunk_pos) = chunk_list
-                                    .get_chunk_index_by_offset(SeekFrom::Start(file_length - 1))?;
-                                let chunk_id = chunk_list
-                                    .get_chunk(chunk_index as usize)?
-                                    .expect("chunk id should exist");
-                                match chunk_pos.cmp(
-                                    &chunk_id.get_length().expect("chunk id should have length"),
-                                ) {
-                                    std::cmp::Ordering::Less => {
-                                        info!(
-                                            "chunk pos: {}, file pos: {}, chunk index: {}",
-                                            chunk_pos, file_length, chunk_index
-                                        );
-                                        (chunk_index, file_length - (chunk_pos + 1))
-                                    }
-                                    std::cmp::Ordering::Equal => {
-                                        info!(
-                                            "chunk pos: {}, file pos: {}, chunk index: {}",
-                                            chunk_pos, file_length, chunk_index
-                                        );
-                                        (chunk_index + 1, file_length)
-                                    }
-                                    std::cmp::Ordering::Greater => {
-                                        unreachable!(
-                                            "chunk pos: {}, file pos: {}, chunk index: {}",
-                                            chunk_pos, file_length, chunk_index
-                                        );
-                                    }
-                                }
-                            } else {
-                                (0, 0)
-                            };
-
-                            for chunk_index in chunk_index..chunk_list.len() {
-                                let chunk_index = chunk_index as usize;
-                                let chunk_id = chunk_list
-                                    .get_chunk(chunk_index)?
-                                    .expect("chunk id should exist");
-                                let chunk_data = reader.get_chunk(&chunk_id).await?;
-                                assert_eq!(
-                                    chunk_data.len() as u64,
-                                    chunk_id.get_length().expect("chunk id should have length"),
-                                    "chunk data length should match the chunk id length."
-                                );
-
-                                let hasher = ChunkHasher::new(None).expect("hash failed.");
-                                let hash = hasher.calc_from_bytes(chunk_data.as_slice());
-                                let calc_chunk_id = ChunkId::from_mix_hash_result_by_hash_method(
-                                    chunk_data.len() as u64,
-                                    &hash,
-                                    HashMethod::Sha256,
-                                )?;
-                                if calc_chunk_id != chunk_id {
-                                    error!(
-                                        "chunk id mismatch, expected: {:?}, got: {:?}",
-                                        calc_chunk_id, chunk_id
-                                    );
-                                    return Err(NdnError::InvalidData(
-                                        "chunk id mismatch".to_string(),
-                                    ));
-                                }
-
-                                file_writer
-                                    .write_chunk(chunk_data.as_slice(), SeekFrom::Start(pos))
-                                    .await?;
-                                pos += chunk_data.len() as u64;
-                            }
-
-                            storage.complete(item_id).await?;
-                        }
-                        StorageItem::Chunk(chunk_item) => {
-                            unreachable!(
-                                "should not have chunk item in dir transfer, got: {:?}",
-                                chunk_item.chunk_id
-                            );
-                        }
-                    }
-                    Ok(())
-                };
-
-                if let Some((path, root_obj_id)) = dir_path_root_obj_id {
-                    info!(
-                        "scan path: {}, root obj id: {}",
-                        path.display(),
-                        root_obj_id
-                    );
-                    writer.create_dir_all(path.as_path()).await?;
-                    create_new_item(path.as_path(), &root_obj_id, None, 0).await?;
-                }
 
                 loop {
-                    let items = storage.select_item_transfer(Some(0), Some(64)).await?;
-                    if items.is_empty() {
-                        info!("no more items to transfer.");
-                        break;
-                    }
-
-                    for (item_id, item, parent_path, item_status, depth) in items {
-                        info!("transfer item: {:?}, status: {:?}", item_id, item_status);
-                        assert!(item_status.is_transfer());
-                        assert_eq!(depth, 0, "item depth should be 0 for root item transfer.");
-
-                        transfer_item(&item_id, &item, parent_path.as_path(), depth).await?;
+                    let line = pipeline_reader.next_line().await?;
+                    match line {
+                        Some((line, line_index)) => {
+                            storage.begin_transaction().await?;
+                            match line_index {
+                                LineIndexWithRelation::Real(line_index) => {
+                                    create_new_item(line, line_index).await?;
+                                }
+                                LineIndexWithRelation::Ref(line_index) => {
+                                    info!(
+                                        "line index is a reference: {:?}, line: {:?}",
+                                        line_index, line
+                                    );
+                                    // 可能是向writer主动请求的对象，暂时先不支持
+                                    continue;
+                                }
+                            }
+                            storage.commit_transaction().await?;
+                            // TODO: rollback on error
+                        }
+                        None => break,
                     }
                 }
 
                 Ok(())
             };
 
-            tokio::spawn(async move { proc().await })
+            tokio::spawn(async move { read_pipeline().await })
         };
 
-        task_handle.await.expect("task abort")?;
+        let fs_dir_build_task_handle = {
+            let storage = storage.clone();
+            let pipeline_reader = pipeline_reader.clone();
+
+            let mut transfer_file = async || -> NdnResult<()> {
+                // TODO: in batch
+                let chunklist_list = storage.select_chunklist_transfer(None, None).await?;
+                for chunk_list_item in chunklist_list {
+                    match &chunk_list_item.obj_status {
+                        RestoreItemStatus::New => {
+                            // nothing to do here
+                            unreachable!(
+                                "chunklist item should not be in New status for transfer child, item id: {:?}",
+                                chunk_list_item.item_id
+                            );
+                        }
+                        RestoreItemStatus::CheckHashing => {
+                            // nothing to do here
+                            unreachable!(
+                                "chunklist item should not be in CheckHashing status for transfer child, item id: {:?}",
+                                chunk_list_item.item_id
+                            );
+                        }
+                        RestoreItemStatus::Transfer(save_path) => {
+                            info!(
+                                "transfer chunklist: {:?}, path: {}",
+                                chunk_list_item.obj_id,
+                                save_path.display()
+                            );
+                            if let Some((line, content_index)) = &chunk_list_item.line {
+                                let chunk_list_header =
+                                    if let Line::ObjArray { header, content } = line {
+                                        match header {
+                                            CollectionHeader::Header { id, header } => {
+                                                // check if the id matches the chunk list obj_id
+                                                header
+                                            }
+                                            CollectionHeader::Index(_) => {
+                                                if let Line::ObjHeader {
+                                                    obj_index,
+                                                    id,
+                                                    header,
+                                                } = &chunk_list_item
+                                                    .header_line
+                                                    .as_ref()
+                                                    .expect("header line should exist")
+                                                    .0
+                                                {
+                                                    // check if the obj_index matches the chunk list obj_id
+                                                    assert_eq!(obj_index, content_index);
+                                                    header
+                                                } else {
+                                                    unreachable!(
+                                                        "expect chunk list header to be ObjHeader"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        unreachable!("expect chunk list line, got: {:?}", line);
+                                    };
+
+                                let chunk_list = ChunkListBuilder::open(chunk_list_header.clone())
+                                    .await?
+                                    .build()
+                                    .await?;
+
+                                if let Some(parent) = save_path.parent() {
+                                    info!("create dir: {}", parent.display());
+                                    writer.create_dir_all(parent).await?;
+                                }
+                                let file_writer = writer.open_file(save_path.as_path()).await?;
+                                let mut file_size = file_writer.length().await?;
+                                let mut write_pos = 0;
+                                let mut write_chunk_seq = 0;
+                                // check existed chunks
+                                if file_size > 0 {
+                                    for chunk_seq in 0..chunk_list.len() {
+                                        let chunk_id = chunk_list
+                                            .get_chunk(chunk_seq as usize)
+                                            .expect("chunk id should exist")
+                                            .expect("chunk id should not be None");
+                                        let chunk_size = chunk_id
+                                            .get_length()
+                                            .expect("chunk id should have length");
+                                        if write_pos + chunk_size > file_size {
+                                            if write_pos < file_size {
+                                                file_writer
+                                                    .truncate(SeekFrom::Start(write_pos))
+                                                    .await?;
+                                            }
+                                            break;
+                                        }
+                                        let chunk_data = file_writer
+                                            .read_chunk(
+                                                std::io::SeekFrom::Start(write_pos),
+                                                chunk_size,
+                                            )
+                                            .await?;
+                                        let mut hasher = ChunkHasher::new_with_hash_method(
+                                            chunk_id.chunk_type.to_hash_method()?,
+                                        )
+                                        .expect("hash failed.");
+                                        assert!(
+                                            chunk_id.chunk_type.is_mix(),
+                                            "chunk data length should match the chunk id length.",
+                                        );
+                                        let chunk_id_from_file = hasher
+                                            .calc_mix_chunk_id_from_bytes(chunk_data.as_slice())?;
+                                        if chunk_id_from_file != chunk_id {
+                                            file_writer
+                                                .truncate(SeekFrom::Start(write_pos))
+                                                .await?;
+                                            break;
+                                        }
+                                        write_chunk_seq = chunk_seq;
+                                        write_pos += chunk_size;
+                                    }
+                                }
+
+                                for chunk_seq in write_chunk_seq..chunk_list.len() {
+                                    let chunk_id = chunk_list
+                                        .get_chunk(chunk_seq as usize)
+                                        .expect("chunk id should exist")
+                                        .expect("chunk id should not be None");
+                                    let chunk_size =
+                                        chunk_id.get_length().expect("chunk id should have length");
+                                    let chunk_data = ndn_reader.get_chunk(&chunk_id).await?;
+                                    assert_eq!(
+                                        chunk_data.len() as u64,
+                                        chunk_size,
+                                        "chunk data length should match the chunk id length."
+                                    );
+                                    file_writer
+                                        .write_chunk(
+                                            chunk_data.as_slice(),
+                                            SeekFrom::Start(write_pos),
+                                        )
+                                        .await?;
+                                    write_pos += chunk_size;
+                                }
+                                info!(
+                                    "chunklist transfer complete: {}, size: {}",
+                                    save_path.display(),
+                                    write_pos
+                                );
+
+                                let target_path = chunk_list_item.status.check_transfer();
+                                if save_path.as_path() != target_path {
+                                    // if the save path is not the final path, we need to move it
+                                    fs::copy(save_path.as_path(), target_path)
+                                        .map_err(|err| NdnError::IoError(err.to_string()))?;
+                                }
+
+                                storage
+                                    .complete(&ItemSelectKey::ItemId(
+                                        chunk_list_item.fs_item_id.clone().unwrap(),
+                                    ))
+                                    .await?;
+                                storage
+                                    .set_transfer_to_complete_with_all_children_complete()
+                                    .await?;
+                            } else {
+                                unreachable!(
+                                    "object line should be some when it is in Transfer status."
+                                );
+                            }
+                        }
+                        RestoreItemStatus::Complete(path) => {
+                            info!("complete chunklist transfer: {}", path.display());
+                            // copy it to the final path
+                            let target_path = chunk_list_item.status.check_transfer();
+                            fs::copy(path, target_path)
+                                .map_err(|err| NdnError::IoError(err.to_string()))?;
+                            storage
+                                .complete(&ItemSelectKey::ItemId(
+                                    chunk_list_item.fs_item_id.clone().unwrap(),
+                                ))
+                                .await?;
+                            storage
+                                .set_transfer_to_complete_with_all_children_complete()
+                                .await?;
+                        }
+                    }
+                }
+                Ok(())
+            };
+
+            let check_hash = async || -> NdnResult<()> {
+                info!("check hash for items in CheckHashing status...");
+
+                let items = storage
+                    .select_children_check_hashing_with_parent_transfer(None, None)
+                    .await?;
+                for (item, parent_item) in items.iter() {
+                    item.status.check_check_hashing();
+                    let parent_path = parent_item.status.check_transfer();
+
+                    if let Some((line, _)) = &item.line {
+                        if let Line::Obj { id, obj } = line {
+                            if id.obj_type.as_str() == OBJ_TYPE_FILE {
+                                let file_obj = serde_json::from_value::<FileObject>(obj.clone())
+                                    .map_err(|err| NdnError::DecodeError(err.to_string()))?;
+                                let chunk_list_id = ObjId::try_from(file_obj.content.as_str())?;
+                                info!(
+                                    "check file object: {}, chunk list id: {}",
+                                    item.item_id, chunk_list_id
+                                );
+                                let chunk_list = ndn_reader.get_chunk_list(&chunk_list_id).await?;
+                                let mut hasher = ChunkHasher::new_with_hash_method(
+                                    file_obj.content_type.to_hash_method()?,
+                                )
+                                .expect("hash failed.");
+                                let mut file_size = 0;
+                                for chunk_id in chunk_list.iter() {
+                                    let chunk_data = ndn_reader.get_chunk(chunk_id).await?;
+                                    file_size += chunk_data.len() as u64;
+                                    hasher.update(chunk_data.as_slice())?;
+                                }
+                                let file_hash = hasher.finalize()?;
+                                info!(
+                                    "file object: {}, size: {}, hash: {}",
+                                    item.item_id, file_size, file_hash
+                                );
+                                storage
+                                    .set_transfer_to_complete_with_all_children_complete()
+                                    .await?;
+                            } else if id.obj_type.as_str() == OBJ_TYPE_DIR {
+                                let dir_obj = serde_json::from_value::<DirObject>(obj.clone())
+                                    .map_err(|err| NdnError::DecodeError(err.to_string()))?;
+                                let dir_obj_id = ObjId::try_from(dir_obj.content.as_str())?;
+                                info!(
+                                    "check dir object: {}, dir obj id: {}",
+                                    item.item_id, dir_obj_id
+                                );
+                                // For directory, we just check if the content object exists
+                                if ndn_reader.get_object(&dir_obj_id).await.is_err() {
+                                    return Err(NdnError::NotFound(format!(
+                                        "directory object not found: {}",
+                                        dir_obj_id
+                                    )));
+                                }
+                                storage
+                                    .set_transfer_to_complete_with_all_children_complete()
+                                    .await?;
+                            } else {
+                                warn!(
+                                    "unsupported object type for check hashing: {}, item id: {}",
+                                    id.obj_type, item.item_id
+                                );
+                                // For other object types, we just mark it as complete
+                                storage
+                                    .set_transfer_to_complete_with_all_children_complete()
+                                    .await?;
+                            }
+                        } else {
+                            warn!(
+                                "unsupported line type for check hashing: {:?}, item id: {}",
+                                line, item.item_id
+                            );
+                            // For unsupported line types, we just mark it as complete
+                            storage
+                                .set_transfer_to_complete_with_all_children_complete()
+                                .await?;
+                        }
+                    } else {
+                        warn!(
+                            "item line should be some, but got None, item id: {}",
+                            item.item_id
+                        );
+                        // If the line is None, we just mark it as complete
+                        storage
+                            .set_transfer_to_complete_with_all_children_complete()
+                            .await?;
+                    }
+                }
+                Ok(())
+            };
+
+            loop {
+                transfer_file().await?;
+            }
+        };
+
+        pipeline_task_handle.await.expect("pipeline task abort")?;
 
         // TODO: should wait for the root item to be created.
         let (root_item_id, item, parent_path, _, depth) = storage.get_root().await?;
