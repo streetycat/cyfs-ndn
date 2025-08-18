@@ -2152,7 +2152,7 @@ mod dir_restore {
     };
 
     use crate::{
-        chunk, copy_chunk,
+        build_named_object_by_json, chunk, copy_chunk,
         packed_obj_pipeline::demo::{
             dir_backup::{
                 ContainerLineIndex, DirObject, FileSystemFileWriter, FileSystemWriter,
@@ -2161,8 +2161,8 @@ mod dir_restore {
             CollectionHeader, Line, LineIndex, LineIndexWithRelation, ObjArrayLine,
             ObjArraySubObjIndex, ObjMapLine, Reader,
         },
-        ChunkHasher, ChunkListBuilder, FileObject, NdnError, NdnResult, ObjId, OBJ_TYPE_DIR,
-        OBJ_TYPE_FILE,
+        ChunkHasher, ChunkId, ChunkListBody, ChunkListBuilder, FileObject, HashMethod, NdnError,
+        NdnResult, ObjId, OBJ_TYPE_DIR, OBJ_TYPE_FILE,
     };
 
     pub enum RestoreItemStatus {
@@ -2814,71 +2814,168 @@ mod dir_restore {
                     let parent_path = parent_item.status.check_transfer();
 
                     if let Some((line, _)) = &item.line {
-                        if let Line::Obj { id, obj } = line {
-                            if id.obj_type.as_str() == OBJ_TYPE_FILE {
-                                let file_obj = serde_json::from_value::<FileObject>(obj.clone())
+                        match line {
+                            Line::Obj { id, obj } => {
+                                if id.obj_type.as_str() == OBJ_TYPE_FILE {
+                                    let file_obj = serde_json::from_value::<FileObject>(
+                                        obj.clone(),
+                                    )
                                     .map_err(|err| NdnError::DecodeError(err.to_string()))?;
-                                let chunk_list_id = ObjId::try_from(file_obj.content.as_str())?;
-                                info!(
-                                    "check file object: {}, chunk list id: {}",
-                                    item.item_id, chunk_list_id
-                                );
-                                let chunk_list = ndn_reader.get_chunk_list(&chunk_list_id).await?;
-                                let mut hasher = ChunkHasher::new_with_hash_method(
-                                    file_obj.content_type.to_hash_method()?,
-                                )
-                                .expect("hash failed.");
-                                let mut file_size = 0;
-                                for chunk_id in chunk_list.iter() {
-                                    let chunk_data = ndn_reader.get_chunk(chunk_id).await?;
-                                    file_size += chunk_data.len() as u64;
-                                    hasher.update(chunk_data.as_slice())?;
+                                    let (file_id, _) = file_obj.gen_obj_id();
+                                    if &file_id != id {
+                                        return Err(NdnError::InvalidId(format!(
+                                            "file id mismatch: {}, expected: {}",
+                                            file_id, id
+                                        )));
+                                    }
+                                    storage
+                                        .begin_transfer(
+                                            &ItemSelectKey::ItemId(
+                                                item.fs_item_id.unwrap().clone(),
+                                            ),
+                                            &parent_path.join(file_obj.name.as_str()).as_path(),
+                                        )
+                                        .await?;
+                                } else if id.obj_type.as_str() == OBJ_TYPE_DIR {
+                                    let dir_obj = serde_json::from_value::<DirObject>(obj.clone())
+                                        .map_err(|err| NdnError::DecodeError(err.to_string()))?;
+                                    let (dir_obj_id, _) = dir_obj.gen_obj_id();
+                                    if &dir_obj_id != id {
+                                        return Err(NdnError::InvalidId(format!(
+                                            "dir id mismatch: {}, expected: {}",
+                                            dir_obj_id, id
+                                        )));
+                                    }
+                                    storage
+                                        .begin_transfer(
+                                            &ItemSelectKey::ItemId(
+                                                item.fs_item_id.unwrap().clone(),
+                                            ),
+                                            &parent_path.join(dir_obj.name.as_str()).as_path(),
+                                        )
+                                        .await?;
+                                } else {
+                                    warn!(
+                                        "unsupported object type for check hashing: {}, item id: {:?}",
+                                        id.obj_type, item.item_id
+                                    );
                                 }
-                                let file_hash = hasher.finalize()?;
-                                info!(
-                                    "file object: {}, size: {}, hash: {}",
-                                    item.item_id, file_size, file_hash
-                                );
-                                storage
-                                    .set_transfer_to_complete_with_all_children_complete()
-                                    .await?;
-                            } else if id.obj_type.as_str() == OBJ_TYPE_DIR {
-                                let dir_obj = serde_json::from_value::<DirObject>(obj.clone())
-                                    .map_err(|err| NdnError::DecodeError(err.to_string()))?;
-                                let dir_obj_id = ObjId::try_from(dir_obj.content.as_str())?;
-                                info!(
-                                    "check dir object: {}, dir obj id: {}",
-                                    item.item_id, dir_obj_id
-                                );
-                                // For directory, we just check if the content object exists
-                                if ndn_reader.get_object(&dir_obj_id).await.is_err() {
-                                    return Err(NdnError::NotFound(format!(
-                                        "directory object not found: {}",
-                                        dir_obj_id
-                                    )));
-                                }
-                                storage
-                                    .set_transfer_to_complete_with_all_children_complete()
-                                    .await?;
-                            } else {
-                                warn!(
-                                    "unsupported object type for check hashing: {}, item id: {}",
-                                    id.obj_type, item.item_id
-                                );
-                                // For other object types, we just mark it as complete
-                                storage
-                                    .set_transfer_to_complete_with_all_children_complete()
-                                    .await?;
                             }
-                        } else {
-                            warn!(
-                                "unsupported line type for check hashing: {:?}, item id: {}",
-                                line, item.item_id
-                            );
-                            // For unsupported line types, we just mark it as complete
-                            storage
-                                .set_transfer_to_complete_with_all_children_complete()
-                                .await?;
+                            Line::Chunk(chunk_id) => {
+                                // nothing to do here, chunk id is already in the item
+                            }
+                            Line::ObjArray { header, content } => {
+                                // ObjArrayLine: check the header and content
+                                let obj_array_id = item.obj_id.unwrap();
+                                let chunk_list_body = match header {
+                                    CollectionHeader::Header { id, header } => {
+                                        assert_eq!(
+                                            id, &obj_array_id,
+                                            "obj array id mismatch: {}, expected: {}",
+                                            id, obj_array_id
+                                        );
+                                        header
+                                    }
+                                    CollectionHeader::Index(_) => {
+                                        if let Line::ObjHeader {
+                                            obj_index,
+                                            id,
+                                            header,
+                                        } = &item
+                                            .header_line
+                                            .as_ref()
+                                            .expect("header line should exist")
+                                            .0
+                                        {
+                                            assert_eq!(
+                                                id, &obj_array_id,
+                                                "obj array id mismatch: {}, expected: {}",
+                                                id, obj_array_id
+                                            );
+                                            header
+                                        } else {
+                                            unreachable!(
+                                                "expect chunk list header to be Header, got: {:?}",
+                                                item.header_line
+                                            )
+                                        }
+                                    }
+                                };
+
+                                let chunk_list_body = serde_json::from_value::<ChunkListBody>(
+                                    chunk_list_body.clone(),
+                                )
+                                .map_err(|err| NdnError::DecodeError(err.to_string()))?;
+                                match content {
+                                    ObjArrayLine::Memory(obj_ids) => {
+                                        let mut chunk_list_builder =
+                                            ChunkListBuilder::new(HashMethod::Sha256);
+                                        if let Some(fix_size) = chunk_list_body.fix_size {
+                                            chunk_list_builder =
+                                                chunk_list_builder.with_fixed_size(fix_size);
+                                        }
+                                        chunk_list_builder = chunk_list_builder
+                                            .with_total_size(chunk_list_body.total_size);
+                                        for obj_id in obj_ids {
+                                            if obj_id.is_chunk() {
+                                                chunk_list_builder
+                                                    .append(ChunkId::from_obj_id(obj_id))?;
+                                            } else {
+                                                return Err(NdnError::InvalidId(format!(
+                                                    "obj array item is not a chunk id: {}",
+                                                    obj_id
+                                                )));
+                                            }
+                                        }
+                                        let chunk_list = chunk_list_builder.build().await?;
+                                        let (chunk_list_id, _) = chunk_list.calc_obj_id();
+                                        if chunk_list_id != obj_array_id {
+                                            return Err(NdnError::InvalidId(format!(
+                                                "obj array id mismatch: {}, expected: {}",
+                                                chunk_list_id, obj_array_id
+                                            )));
+                                        }
+                                    }
+                                    ObjArrayLine::File(path_buf) => {
+                                        unreachable!("FileObjArray not implemented in demo");
+                                    }
+                                    ObjArrayLine::Lines(items) => todo!(),
+                                    ObjArrayLine::Diff {
+                                        base_array,
+                                        actions,
+                                    } => {
+                                        unreachable!("ObjArrayLine::Diff not implemented in demo");
+                                    }
+                                }
+                            }
+                            Line::ObjMap { header, content } => todo!(),
+                            Line::Index {
+                                obj_start_index,
+                                obj_ids,
+                                obj_header_start_index,
+                            } => {
+                                unreachable!("Index line not implemented in demo");
+                            }
+                            Line::ObjHeader {
+                                obj_index,
+                                id,
+                                header,
+                            } => {
+                                unreachable!("ObjHeader line not implemented in demo");
+                            }
+                            Line::Header(header) => {
+                                unreachable!(
+                                    "Header line should not be in CheckHashing status, item id: {:?}",
+                                    item.item_id
+                                );
+                            }
+                            Line::RebuildObj {
+                                indexes,
+                                ranges,
+                                ids,
+                            } => {
+                                unreachable!("RebuildObj line not implemented in demo");
+                            }
                         }
                     } else {
                         warn!(
