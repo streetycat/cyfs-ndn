@@ -2149,14 +2149,15 @@ mod dir_restore {
         fs,
         io::SeekFrom,
         path::{Path, PathBuf},
+        time::Duration,
     };
 
     use crate::{
         build_named_object_by_json, chunk, copy_chunk,
         packed_obj_pipeline::demo::{
             dir_backup::{
-                ContainerLineIndex, DirObject, FileSystemFileWriter, FileSystemWriter,
-                ItemSelectKey, NdnReader, StorageItemName,
+                ContainerLineIndex, DirObject, FileSystemFileWriter, FileSystemWriter, NdnReader,
+                StorageItemName,
             },
             CollectionHeader, Line, LineIndex, LineIndexWithRelation, ObjArrayLine,
             ObjArraySubObjIndex, ObjMapLine, Reader,
@@ -2164,6 +2165,12 @@ mod dir_restore {
         ChunkHasher, ChunkId, ChunkListBody, ChunkListBuilder, FileObject, HashMethod, NdnError,
         NdnResult, ObjId, OBJ_TYPE_DIR, OBJ_TYPE_FILE,
     };
+
+    pub enum RestoreItemSelectKey<IT> {
+        ItemId(IT),
+        FsItemId(IT),
+        FsChild(IT, StorageItemName), // <parent_fs_item_id, child_name>
+    }
 
     pub enum RestoreItemStatus {
         New,
@@ -2173,6 +2180,18 @@ mod dir_restore {
     }
 
     impl RestoreItemStatus {
+        pub fn is_new(&self) -> bool {
+            matches!(self, RestoreItemStatus::New)
+        }
+        pub fn is_check_hashing(&self) -> bool {
+            matches!(self, RestoreItemStatus::CheckHashing)
+        }
+        pub fn is_transfer(&self) -> bool {
+            matches!(self, RestoreItemStatus::Transfer(_))
+        }
+        pub fn is_complete(&self) -> bool {
+            matches!(self, RestoreItemStatus::Complete(_))
+        }
         pub fn check_check_hashing(&self) {
             match self {
                 RestoreItemStatus::New => {
@@ -2268,11 +2287,11 @@ mod dir_restore {
 
         async fn begin_transfer(
             &self,
-            key: &ItemSelectKey<Self::ItemId>,
+            key: &RestoreItemSelectKey<Self::ItemId>,
             save_path: &Path,
         ) -> NdnResult<Option<ContainerLineIndex>>;
 
-        async fn complete(&self, key: &ItemSelectKey<Self::ItemId>) -> NdnResult<()>;
+        async fn complete(&self, key: &RestoreItemSelectKey<Self::ItemId>) -> NdnResult<()>;
 
         async fn set_transfer_to_complete_with_all_children_complete(&self) -> NdnResult<u64>; // changed lines count
 
@@ -2288,6 +2307,13 @@ mod dir_restore {
             limit: Option<u64>,
         ) -> NdnResult<Vec<LineStorageItem<Self::ItemId>>>;
 
+        async fn list_children_order_by_child_seq(
+            &self,
+            key: &RestoreItemSelectKey<Self::ItemId>,
+            offset: Option<u64>,
+            limit: Option<u64>,
+        ) -> NdnResult<Vec<LineStorageItem<Self::ItemId>>>;
+
         async fn get_root(&self) -> NdnResult<Option<LineStorageItem<Self::ItemId>>>;
 
         async fn begin_transaction(&self) -> NdnResult<()>;
@@ -2298,16 +2324,16 @@ mod dir_restore {
     pub async fn ndn_to_file_system<
         S: RestoreStorage + 'static,
         FFW: FileSystemFileWriter + 'static,
-        F: FileSystemWriter<FFW> + 'static,
-        PR: Reader + Clone + 'static,
-        NR: NdnReader + 'static,
+        F: FileSystemWriter<FFW> + Clone + 'static,
+        PR: Reader + Clone + Send + Sync + 'static,
+        NR: NdnReader + Clone + 'static,
     >(
         dir_path_root_obj_id: Option<(&Path, &ObjId)>, // <root-path, root-obj-id>, None for continue
         writer: F,
-        pipeline_reader: PR,
+        mut pipeline_reader: PR,
         ndn_reader: NR,
         storage: S,
-    ) -> NdnResult<S::ItemId> {
+    ) -> NdnResult<()> {
         if let Some((path, root_obj_id)) = dir_path_root_obj_id {
             info!(
                 "scan path: {}, root obj id: {}",
@@ -2329,12 +2355,10 @@ mod dir_restore {
         }
 
         let pipeline_task_handle = {
-            let dir_path_root_obj_id = dir_path_root_obj_id
-                .as_ref()
-                .map(|(path, obj_id)| (path.to_path_buf(), (*obj_id).clone()));
             let storage = storage.clone();
+            let mut pipeline_reader = pipeline_reader.clone();
 
-            let read_pipeline = async move || -> NdnResult<()> {
+            let mut read_pipeline = async move |storage: S| -> NdnResult<()> {
                 info!("start ndn to file system task...");
 
                 let create_new_item = async |line: Line, line_index: LineIndex| -> NdnResult<()> {
@@ -2427,7 +2451,10 @@ mod dir_restore {
                                 ObjArrayLine::Memory(obj_list) => {
                                     let mut child_infos = Vec::with_capacity(obj_list.len());
                                     for seq in 0..obj_list.len() {
-                                        let child_obj_id = obj_list[seq];
+                                        let child_obj_id = obj_list
+                                            .get(seq)
+                                            .expect("obj_list should have enough items")
+                                            .clone();
                                         child_infos.push(ChildInfo {
                                             name: Some(StorageItemName::ChunkSeq(seq as u64)),
                                             child_line_index: None,
@@ -2612,14 +2639,24 @@ mod dir_restore {
                 Ok(())
             };
 
-            tokio::spawn(async move { read_pipeline().await })
+            tokio::spawn(async move { read_pipeline(storage).await })
         };
 
         let fs_dir_build_task_handle = {
             let storage = storage.clone();
             let pipeline_reader = pipeline_reader.clone();
+            let ndn_reader = ndn_reader.clone();
 
-            let mut transfer_file = async || -> NdnResult<()> {
+            async fn transfer_file<
+                S: RestoreStorage + 'static,
+                FFW: FileSystemFileWriter + 'static,
+                F: FileSystemWriter<FFW> + 'static,
+                NR: NdnReader + Clone + 'static,
+            >(
+                storage: S,
+                ndn_reader: NR,
+                writer: F,
+            ) -> NdnResult<()> {
                 // TODO: in batch
                 let chunklist_list = storage.select_chunklist_transfer(None, None).await?;
                 for chunk_list_item in chunklist_list {
@@ -2770,7 +2807,7 @@ mod dir_restore {
                                 }
 
                                 storage
-                                    .complete(&ItemSelectKey::ItemId(
+                                    .complete(&RestoreItemSelectKey::FsItemId(
                                         chunk_list_item.fs_item_id.clone().unwrap(),
                                     ))
                                     .await?;
@@ -2790,7 +2827,7 @@ mod dir_restore {
                             fs::copy(path, target_path)
                                 .map_err(|err| NdnError::IoError(err.to_string()))?;
                             storage
-                                .complete(&ItemSelectKey::ItemId(
+                                .complete(&RestoreItemSelectKey::FsItemId(
                                     chunk_list_item.fs_item_id.clone().unwrap(),
                                 ))
                                 .await?;
@@ -2803,7 +2840,7 @@ mod dir_restore {
                 Ok(())
             };
 
-            let check_hash = async || -> NdnResult<()> {
+            async fn check_hash<S: RestoreStorage + 'static>(storage: S) -> NdnResult<()> {
                 info!("check hash for items in CheckHashing status...");
 
                 let items = storage
@@ -2830,8 +2867,8 @@ mod dir_restore {
                                     }
                                     storage
                                         .begin_transfer(
-                                            &ItemSelectKey::ItemId(
-                                                item.fs_item_id.unwrap().clone(),
+                                            &RestoreItemSelectKey::FsItemId(
+                                                item.fs_item_id.clone().unwrap(),
                                             ),
                                             &parent_path.join(file_obj.name.as_str()).as_path(),
                                         )
@@ -2848,8 +2885,8 @@ mod dir_restore {
                                     }
                                     storage
                                         .begin_transfer(
-                                            &ItemSelectKey::ItemId(
-                                                item.fs_item_id.unwrap().clone(),
+                                            &RestoreItemSelectKey::FsItemId(
+                                                item.fs_item_id.clone().unwrap(),
                                             ),
                                             &parent_path.join(dir_obj.name.as_str()).as_path(),
                                         )
@@ -2866,11 +2903,11 @@ mod dir_restore {
                             }
                             Line::ObjArray { header, content } => {
                                 // ObjArrayLine: check the header and content
-                                let obj_array_id = item.obj_id.unwrap();
+                                let obj_array_id = item.obj_id.as_ref().unwrap();
                                 let chunk_list_body = match header {
                                     CollectionHeader::Header { id, header } => {
                                         assert_eq!(
-                                            id, &obj_array_id,
+                                            id, obj_array_id,
                                             "obj array id mismatch: {}, expected: {}",
                                             id, obj_array_id
                                         );
@@ -2888,7 +2925,7 @@ mod dir_restore {
                                             .0
                                         {
                                             assert_eq!(
-                                                id, &obj_array_id,
+                                                id, obj_array_id,
                                                 "obj array id mismatch: {}, expected: {}",
                                                 id, obj_array_id
                                             );
@@ -2906,49 +2943,192 @@ mod dir_restore {
                                     chunk_list_body.clone(),
                                 )
                                 .map_err(|err| NdnError::DecodeError(err.to_string()))?;
-                                match content {
-                                    ObjArrayLine::Memory(obj_ids) => {
-                                        let mut chunk_list_builder =
-                                            ChunkListBuilder::new(HashMethod::Sha256);
-                                        if let Some(fix_size) = chunk_list_body.fix_size {
-                                            chunk_list_builder =
-                                                chunk_list_builder.with_fixed_size(fix_size);
+                                let mut chunk_list_builder =
+                                    ChunkListBuilder::new(HashMethod::Sha256);
+                                if let Some(fix_size) = chunk_list_body.fix_size {
+                                    chunk_list_builder =
+                                        chunk_list_builder.with_fixed_size(fix_size);
+                                }
+                                chunk_list_builder =
+                                    chunk_list_builder.with_total_size(chunk_list_body.total_size);
+                                let mut child_obj_ids_from_storage = Vec::new();
+                                let child_obj_ids = match content {
+                                    ObjArrayLine::Memory(obj_ids) => obj_ids,
+                                    _ => {
+                                        let children = storage
+                                            .list_children_order_by_child_seq(
+                                                &RestoreItemSelectKey::FsItemId(
+                                                    item.fs_item_id
+                                                        .clone()
+                                                        .expect("fs item id should exist"),
+                                                ),
+                                                None,
+                                                None,
+                                            )
+                                            .await?;
+                                        child_obj_ids_from_storage = children
+                                            .into_iter()
+                                            .map(|child| {
+                                                child.obj_id.expect("child obj id should exist")
+                                            })
+                                            .collect();
+                                        &child_obj_ids_from_storage
+                                    }
+                                };
+
+                                for obj_id in child_obj_ids {
+                                    if obj_id.is_chunk() {
+                                        chunk_list_builder.append(ChunkId::from_obj_id(obj_id))?;
+                                    } else {
+                                        return Err(NdnError::InvalidId(format!(
+                                            "obj array item is not a chunk id: {}",
+                                            obj_id
+                                        )));
+                                    }
+                                }
+                                let chunk_list = chunk_list_builder.build().await?;
+                                let (chunk_list_id, _) = chunk_list.calc_obj_id();
+                                if &chunk_list_id != obj_array_id {
+                                    return Err(NdnError::InvalidId(format!(
+                                        "obj array id mismatch: {}, expected: {}",
+                                        chunk_list_id, obj_array_id
+                                    )));
+                                }
+                                storage
+                                    .begin_transfer(
+                                        &RestoreItemSelectKey::FsItemId(
+                                            item.fs_item_id.clone().unwrap(),
+                                        ),
+                                        parent_path, // the path is same as the parent path(FileObject)
+                                    )
+                                    .await?;
+                            }
+                            Line::ObjMap { header, content } => {
+                                {
+                                    // ObjMapLine: verify header (TrieObjectMapBody) id matches, then mark ready to transfer
+                                    let obj_map_id = item
+                                        .obj_id
+                                        .as_ref()
+                                        .expect("object map item should have its obj_id");
+                                    let map_body_value = match header {
+                                        CollectionHeader::Header { id, header } => {
+                                            assert_eq!(
+                                                id, obj_map_id,
+                                                "obj map id mismatch: {}, expected: {}",
+                                                id, obj_map_id
+                                            );
+                                            header
                                         }
-                                        chunk_list_builder = chunk_list_builder
-                                            .with_total_size(chunk_list_body.total_size);
-                                        for obj_id in obj_ids {
-                                            if obj_id.is_chunk() {
-                                                chunk_list_builder
-                                                    .append(ChunkId::from_obj_id(obj_id))?;
+                                        CollectionHeader::Index(_) => {
+                                            if let Some((Line::ObjHeader { id, header, .. }, _)) =
+                                                &item.header_line
+                                            {
+                                                assert_eq!(
+                                                    id, obj_map_id,
+                                                    "obj map id mismatch: {}, expected: {}",
+                                                    id, obj_map_id
+                                                );
+                                                header
                                             } else {
-                                                return Err(NdnError::InvalidId(format!(
-                                                    "obj array item is not a chunk id: {}",
-                                                    obj_id
-                                                )));
+                                                unreachable!(
+                                                    "expect ObjHeader for map header line"
+                                                );
                                             }
                                         }
-                                        let chunk_list = chunk_list_builder.build().await?;
-                                        let (chunk_list_id, _) = chunk_list.calc_obj_id();
-                                        if chunk_list_id != obj_array_id {
+                                    };
+
+                                    let map_body =
+                                        serde_json::from_value::<crate::TrieObjectMapBody>(
+                                            map_body_value.clone(),
+                                        )
+                                        .map_err(|e| NdnError::DecodeError(e.to_string()))?;
+
+                                    let (calc_id, _) = map_body.calc_obj_id();
+                                    if &calc_id != obj_map_id {
+                                        return Err(NdnError::InvalidId(format!(
+                                            "obj map id mismatch: {}, expected: {}",
+                                            calc_id, obj_map_id
+                                        )));
+                                    }
+
+                                    // Rebuild TrieObjectMap from current children to double-check final ObjId consistency.
+                                    {
+                                        // Collect children (files/sub-dirs) of this directory map
+                                        let children = storage
+                                            .list_children_order_by_child_seq(
+                                                &RestoreItemSelectKey::FsItemId(
+                                                    item.fs_item_id.clone().expect(
+                                                        "fs item id should exist for TrieObjectMap",
+                                                    ),
+                                                ),
+                                                None,
+                                                None,
+                                            )
+                                            .await?;
+
+                                        // Build a new trie map from children's (name -> obj_id)
+                                        let mut rebuild_builder = crate::TrieObjectMapBuilder::new(
+                                            HashMethod::Sha256,
+                                            None,
+                                        )
+                                        .await?;
+
+                                        for child in children {
+                                            // We only care about object lines (files/dirs). Skip if line not yet arrived.
+                                            if let Some((Line::Obj { id, obj }, _)) = &child.line {
+                                                if id.obj_type.as_str() == OBJ_TYPE_FILE {
+                                                    let file_obj =
+                                                        serde_json::from_value::<FileObject>(
+                                                            obj.clone(),
+                                                        )
+                                                        .map_err(|e| {
+                                                            NdnError::DecodeError(e.to_string())
+                                                        })?;
+                                                    rebuild_builder
+                                                        .put_object(file_obj.name.as_str(), id)?;
+                                                } else if id.obj_type.as_str() == OBJ_TYPE_DIR {
+                                                    let dir_obj =
+                                                        serde_json::from_value::<DirObject>(
+                                                            obj.clone(),
+                                                        )
+                                                        .map_err(|e| {
+                                                            NdnError::DecodeError(e.to_string())
+                                                        })?;
+                                                    rebuild_builder
+                                                        .put_object(dir_obj.name.as_str(), id)?;
+                                                } else {
+                                                    // Ignore other object types (chunks or unsupported)
+                                                }
+                                            } else {
+                                                // If any child object line not ready yet, skip strict verification for now.
+                                                // (Could defer verification until all children available.)
+                                                continue;
+                                            }
+                                        }
+
+                                        let rebuilt_map = rebuild_builder.build().await?;
+                                        let (rebuilt_id, _) = rebuilt_map.calc_obj_id();
+                                        if &rebuilt_id != obj_map_id {
                                             return Err(NdnError::InvalidId(format!(
-                                                "obj array id mismatch: {}, expected: {}",
-                                                chunk_list_id, obj_array_id
+                                                "directory trie map id mismatch after rebuild: {}, expected: {}",
+                                                rebuilt_id, obj_map_id
                                             )));
                                         }
                                     }
-                                    ObjArrayLine::File(path_buf) => {
-                                        unreachable!("FileObjArray not implemented in demo");
-                                    }
-                                    ObjArrayLine::Lines(items) => todo!(),
-                                    ObjArrayLine::Diff {
-                                        base_array,
-                                        actions,
-                                    } => {
-                                        unreachable!("ObjArrayLine::Diff not implemented in demo");
-                                    }
+
+                                    // For a directory's TrieObjectMap, its save path is the parent directory path (same logic as chunk list for files)
+                                    storage
+                                        .begin_transfer(
+                                            &RestoreItemSelectKey::FsItemId(
+                                                item.fs_item_id
+                                                    .clone()
+                                                    .expect("fs item id should exist"),
+                                            ),
+                                            parent_path,
+                                        )
+                                        .await?;
                                 }
                             }
-                            Line::ObjMap { header, content } => todo!(),
                             Line::Index {
                                 obj_start_index,
                                 obj_ids,
@@ -2979,36 +3159,39 @@ mod dir_restore {
                         }
                     } else {
                         warn!(
-                            "item line should be some, but got None, item id: {}",
+                            "item line should be some, but got None, item id: {:?}",
                             item.item_id
                         );
-                        // If the line is None, we just mark it as complete
-                        storage
-                            .set_transfer_to_complete_with_all_children_complete()
-                            .await?;
                     }
                 }
                 Ok(())
             };
 
-            loop {
-                transfer_file().await?;
-            }
+            let rebuild_dir = async |storage: S, ndn_reader: NR, writer: F| -> NdnResult<()> {
+                loop {
+                    transfer_file(storage.clone(), ndn_reader.clone(), writer.clone()).await?;
+                    check_hash(storage.clone()).await?;
+                    let root_item = storage.get_root().await?;
+                    if let Some(root_item) = root_item {
+                        if root_item.status.is_complete() {
+                            info!("root item is complete, exit the loop.");
+                            break Ok(());
+                        } else {
+                            info!("root item is not complete, continue to check.");
+                        }
+                    }
+                    // TODO: wakeup when new line read
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            };
+            tokio::spawn(async move { rebuild_dir(storage, ndn_reader, writer.clone()).await })
         };
 
         pipeline_task_handle.await.expect("pipeline task abort")?;
+        fs_dir_build_task_handle
+            .await
+            .expect("fs dir build task abort");
 
-        // TODO: should wait for the root item to be created.
-        let (root_item_id, item, parent_path, _, depth) = storage.get_root().await?;
-        assert_eq!(depth, 0, "root item depth should be 0.");
-        if let Some((dir_path, _)) = dir_path_root_obj_id {
-            assert_eq!(
-                dir_path,
-                parent_path.as_path(),
-                "root item parent path should match the scan path."
-            );
-        }
-
-        Ok(root_item_id)
+        Ok(())
     }
 }
