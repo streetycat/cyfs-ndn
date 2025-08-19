@@ -1194,14 +1194,14 @@ mod dir_backup {
         Chunk(ChunkItem), // (seq, offset, ChunkId)
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     pub enum StorageItemName {
         Name(String),
         ChunkSeq(u64), // seq
     }
 
     impl StorageItemName {
-        fn check_name(&self) -> &str {
+        pub fn check_name(&self) -> &str {
             match self {
                 StorageItemName::Name(name) => name.as_str(),
                 StorageItemName::ChunkSeq(_) => panic!("expect name"),
@@ -1216,7 +1216,7 @@ mod dir_backup {
     }
 
     impl<'a> StorageItemNameRef<'a> {
-        fn check_name(&self) -> &str {
+        pub fn check_name(&self) -> &str {
             match self {
                 StorageItemNameRef::Name(name) => *name,
                 StorageItemNameRef::ChunkSeq(_) => panic!("expect name"),
@@ -1225,41 +1225,41 @@ mod dir_backup {
     }
 
     impl StorageItem {
-        fn is_dir(&self) -> bool {
+        pub fn is_dir(&self) -> bool {
             matches!(self, StorageItem::Dir(_))
         }
-        fn is_file(&self) -> bool {
+        pub fn is_file(&self) -> bool {
             matches!(self, StorageItem::File(_))
         }
-        fn is_chunk(&self) -> bool {
+        pub fn is_chunk(&self) -> bool {
             matches!(self, StorageItem::Chunk(_))
         }
-        fn check_dir(&self) -> &DirObject {
+        pub fn check_dir(&self) -> &DirObject {
             match self {
                 StorageItem::Dir(dir) => dir,
                 _ => panic!("expect dir"),
             }
         }
-        fn check_file(&self) -> &FileStorageItem {
+        pub fn check_file(&self) -> &FileStorageItem {
             match self {
                 StorageItem::File(file) => file,
                 _ => panic!("expect file"),
             }
         }
-        fn check_chunk(&self) -> &ChunkItem {
+        pub fn check_chunk(&self) -> &ChunkItem {
             match self {
                 StorageItem::Chunk(chunk) => chunk,
                 _ => panic!("expect chunk"),
             }
         }
-        fn name(&self) -> StorageItemNameRef<'_> {
+        pub fn name(&self) -> StorageItemNameRef<'_> {
             match self {
                 StorageItem::Dir(dir) => StorageItemNameRef::Name(dir.name.as_str()),
                 StorageItem::File(file) => StorageItemNameRef::Name(file.obj.name.as_str()),
                 StorageItem::Chunk(chunk_item) => StorageItemNameRef::ChunkSeq(chunk_item.seq),
             }
         }
-        fn item_type(&self) -> &str {
+        pub fn item_type(&self) -> &str {
             match self {
                 StorageItem::Dir(_) => "dir",
                 StorageItem::File(_) => "file",
@@ -1270,20 +1270,20 @@ mod dir_backup {
 
     pub type PathDepth = u64;
 
-    #[derive(Clone, Debug)]
+    #[derive(Clone, Debug, Serialize, Deserialize)]
     pub struct ContainerLineIndex {
         pub index: LineIndex,
         pub header_index: Option<LineIndex>,
     }
 
-    #[derive(Clone)]
+    #[derive(Clone, Serialize, Deserialize)]
     pub struct TransferStatusDesc {
         pub obj_id: ObjId,
         pub content_header: Option<Value>,
         pub content_line: Option<ContentLine>, // If it's a ObjArray or ObjMap, return the content line
     }
 
-    #[derive(Clone)]
+    #[derive(Clone, Serialize, Deserialize)]
     pub struct CompleteStatusDesc {
         pub obj_id: ObjId,
         pub content_header: Option<Value>,
@@ -1292,7 +1292,7 @@ mod dir_backup {
         pub container_line_index: Option<ContainerLineIndex>,
     }
 
-    #[derive(Clone)]
+    #[derive(Clone, Serialize, Deserialize)]
     pub enum ItemStatus {
         New,
         Scanning,
@@ -1336,12 +1336,23 @@ mod dir_backup {
         pub fn is_transfer(&self) -> bool {
             matches!(self, ItemStatus::Transfer(_))
         }
-
         pub fn get_obj_id(&self) -> Option<&ObjId> {
             match self {
                 ItemStatus::Transfer(desc) => Some(&desc.obj_id),
                 ItemStatus::Complete(desc) => Some(&desc.obj_id),
                 _ => None,
+            }
+        }
+        pub fn check_transfer(&self) -> &TransferStatusDesc {
+            match self {
+                ItemStatus::Transfer(desc) => desc,
+                _ => panic!("expect TransferStatusDesc"),
+            }
+        }
+        pub fn check_complete(&self) -> &CompleteStatusDesc {
+            match self {
+                ItemStatus::Complete(desc) => desc,
+                _ => panic!("expect CompleteStatusDesc"),
             }
         }
     }
@@ -1352,7 +1363,7 @@ mod dir_backup {
         type ItemId: Send + Sync + Clone + std::fmt::Debug + Eq + std::hash::Hash + Sized;
     }
 
-    #[derive(Clone)]
+    #[derive(Clone, Serialize, Deserialize)]
     pub enum ContentLine {
         Chunk(ChunkId),    // chunk id
         Obj(ObjId, Value), // ObjId, content
@@ -1394,9 +1405,9 @@ mod dir_backup {
         pub status: ItemStatus,
         pub parent_path: PathBuf,
         pub depth: PathDepth,
-        pub is_last_child: bool,
     }
 
+    #[derive(Clone)]
     pub enum ItemSelectKey<IT> {
         ItemId(IT),
         Child(IT, StorageItemName), // <parent_item_id, child_name>
@@ -3193,5 +3204,984 @@ mod dir_restore {
             .expect("fs dir build task abort");
 
         Ok(())
+    }
+}
+
+mod backup_app {
+
+    use std::{
+        collections::{btree_map::Range, HashMap},
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
+
+    use rusqlite::{params, OptionalExtension};
+    use tokio::sync::Mutex;
+
+    use crate::{
+        packed_obj_pipeline::{
+            self,
+            demo::{ObjArrayLine, ObjArraySubObjIndex, ObjMapLine},
+        },
+        ChunkId, FileObject, NdnError, NdnResult, ObjId, OBJ_TYPE_DIR, OBJ_TYPE_FILE,
+    };
+
+    use super::dir_backup::{
+        ContainerLineIndex, ContentLine, DirObject, ItemSelectKey, ItemStatus, PathDepth, Storage,
+        StorageItem, StorageItemDetail, StorageItemName, StorageItemNameRef,
+    };
+
+    fn ser_json<T: serde::Serialize>(v: &T) -> NdnResult<String> {
+        serde_json::to_string(v).map_err(|e| NdnError::DecodeError(e.to_string()))
+    }
+
+    fn de_json<T: for<'de> serde::Deserialize<'de>>(s: &str) -> NdnResult<T> {
+        serde_json::from_str(s).map_err(|e| NdnError::DecodeError(e.to_string()))
+    }
+
+    fn content_line_to_json(cl: &ContentLine) -> NdnResult<serde_json::Value> {
+        Ok(match cl {
+            ContentLine::Chunk(id) => {
+                serde_json::json!({"t":"chunk","id": id.to_string()})
+            }
+            ContentLine::Obj(id, v) => {
+                serde_json::json!({"t":"obj","id": id,"v": v})
+            }
+            ContentLine::Array(a) => {
+                serde_json::json!({"t":"arr","v": a})
+            }
+            ContentLine::Map(m) => {
+                serde_json::json!({"t":"map","v": m})
+            }
+        })
+    }
+
+    fn content_line_from_json(v: &serde_json::Value) -> NdnResult<ContentLine> {
+        let t = v
+            .get("t")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| NdnError::DecodeError("missing t".into()))?;
+        match t {
+            "chunk" => {
+                let id_str = v
+                    .get("id")
+                    .and_then(|x| x.as_str())
+                    .ok_or_else(|| NdnError::DecodeError("missing id".into()))?;
+                let obj_id = ObjId::try_from(id_str)?;
+                Ok(ContentLine::Chunk(crate::ChunkId::from_obj_id(&obj_id)))
+            }
+            "obj" => {
+                let id_v = v
+                    .get("id")
+                    .ok_or_else(|| NdnError::DecodeError("missing id".into()))?;
+                let id: ObjId = serde_json::from_value(id_v.clone())
+                    .map_err(|e| NdnError::DecodeError(e.to_string()))?;
+                let val = v
+                    .get("v")
+                    .ok_or_else(|| NdnError::DecodeError("missing v".into()))?
+                    .clone();
+                Ok(ContentLine::Obj(id, val))
+            }
+            "arr" => {
+                let arr_v = v
+                    .get("v")
+                    .ok_or_else(|| NdnError::DecodeError("missing v".into()))?
+                    .clone();
+                let line: ObjArrayLine = serde_json::from_value(arr_v)
+                    .map_err(|e| NdnError::DecodeError(e.to_string()))?;
+                Ok(ContentLine::Array(line))
+            }
+            "map" => {
+                let map_v = v
+                    .get("v")
+                    .ok_or_else(|| NdnError::DecodeError("missing v".into()))?
+                    .clone();
+                let line: ObjMapLine = serde_json::from_value(map_v)
+                    .map_err(|e| NdnError::DecodeError(e.to_string()))?;
+                Ok(ContentLine::Map(line))
+            }
+            _ => Err(NdnError::DecodeError("unknown content line".into())),
+        }
+    }
+
+    #[derive(Clone)]
+    pub struct SqliteStorage {
+        inner: Arc<std::sync::Mutex<rusqlite::Connection>>,
+        tx_flag: Arc<std::sync::Mutex<bool>>,
+    }
+
+    impl SqliteStorage {
+        pub async fn open(path: impl AsRef<Path>) -> NdnResult<Self> {
+            let path_buf = path.as_ref().to_path_buf();
+            let conn = tokio::task::spawn_blocking(move || {
+                let conn = rusqlite::Connection::open(path_buf)
+                    .map_err(|e| NdnError::IoError(e.to_string()))?;
+                conn.execute_batch(
+                    r#"
+                    PRAGMA journal_mode=WAL;
+                    CREATE TABLE IF NOT EXISTS items(
+                      id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      parent_id INTEGER,
+                      item_type TEXT NOT NULL,
+                      name TEXT,
+                      chunk_seq INTEGER,
+                      data_json TEXT,      -- DirObject/FileObject/Chunk meta
+                      status_kind TEXT NOT NULL,
+                      status_json TEXT NOT NULL,
+                      parent_path TEXT NOT NULL,
+                      depth INTEGER NOT NULL,
+                      obj_id TEXT,
+                      content_header_json TEXT,
+                      content_line_json TEXT,
+                      line_index INTEGER,
+                      container_content_index INTEGER,
+                      container_header_index INTEGER
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_items_parent ON items(parent_id);
+                    "#,
+                )
+                .map_err(|e| NdnError::IoError(e.to_string()))?;
+                Ok::<_, NdnError>(conn)
+            })
+            .await
+            .map_err(|e| NdnError::IoError(e.to_string()))??;
+
+            Ok(Self {
+                inner: Arc::new(std::sync::Mutex::new(conn)),
+                tx_flag: Arc::new(std::sync::Mutex::new(false)),
+            })
+        }
+
+        fn status_kind(s: &ItemStatus) -> &'static str {
+            match s {
+                ItemStatus::New => "New",
+                ItemStatus::Scanning => "Scanning",
+                ItemStatus::Hashing => "Hashing",
+                ItemStatus::Transfer(_) => "Transfer",
+                ItemStatus::Complete(_) => "Complete",
+            }
+        }
+
+        fn serialize_status(s: &ItemStatus) -> NdnResult<String> {
+            ser_json(s)
+        }
+
+        fn deserialize_status(s: &str) -> NdnResult<ItemStatus> {
+            de_json(s)
+        }
+
+        async fn row_to_detail(&self, rowid: i64) -> NdnResult<StorageItemDetail<i64>> {
+            let conn = self.inner.clone();
+            tokio::task::spawn_blocking(move || -> NdnResult<_> {
+                let mut conn_guard = conn
+                    .lock().unwrap();
+                let mut stmt = conn_guard.prepare(
+                    "SELECT id,parent_id,item_type,name,chunk_seq,data_json,status_json,parent_path,depth,
+                            obj_id,content_header_json,content_line_json,line_index,
+                            container_content_index,container_header_index
+                        FROM items WHERE id=?1",
+                )
+                .map_err(|e| NdnError::IoError(e.to_string()))?;
+                let row = stmt
+                    .query_row(params![rowid], |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, Option<i64>>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, Option<String>>(3)?,
+                            r.get::<_, Option<i64>>(4)?,
+                            r.get::<_, Option<String>>(5)?,
+                            r.get::<_, String>(6)?,
+                            r.get::<_, String>(7)?,
+                            r.get::<_, i64>(8)?,
+                            r.get::<_, Option<String>>(9)?,
+                            r.get::<_, Option<String>>(10)?,
+                            r.get::<_, Option<String>>(11)?,
+                            r.get::<_, Option<i64>>(12)?,
+                            r.get::<_, Option<i64>>(13)?,
+                            r.get::<_, Option<i64>>(14)?,
+                        ))
+                    }).optional()
+                    .map_err(|e| NdnError::IoError(e.to_string()))?
+                    .ok_or_else(|| NdnError::NotFound("item not found".into()))?;
+                let (
+                    id,
+                    parent_id,
+                    item_type,
+                    name_opt,
+                    chunk_seq_opt,
+                    data_json,
+                    status_json,
+                    parent_path,
+                    depth,
+                    _obj_id,
+                    _hdr_json,
+                    _cl_json,
+                    _line_index,
+                    _c_content,
+                    _c_header,
+                ) = row;
+                let status = Self::deserialize_status(status_json.as_str())?;
+                let item = match item_type.as_str() {
+                    "dir" => {
+                        let dir: DirObject = de_json(&data_json.unwrap_or_default())?;
+                        StorageItem::Dir(dir)
+                    }
+                    "file" => {
+                        let file: FileObject = de_json(&data_json.unwrap_or_default())?;
+                        StorageItem::File(super::dir_backup::FileStorageItem {
+                            obj: file,
+                            chunk_size: None,
+                        })
+                    }
+                    "chunk" => {
+                        let meta_v: serde_json::Value = de_json(&data_json.unwrap_or_else(|| "{}".into()))?;
+                        let seq = chunk_seq_opt.unwrap_or(0) as u64;
+                        let offset = meta_v
+                            .get("offset")
+                            .and_then(|x| x.as_u64())
+                            .unwrap_or(seq * 0);
+                        let chunk_id = meta_v
+                            .get("chunk_id")
+                            .and_then(|x| x.as_str())
+                            .and_then(|s| ObjId::try_from(s).ok())
+                            .map(|oid| crate::ChunkId::from_obj_id(&oid));
+                        StorageItem::Chunk(super::dir_backup::ChunkItem {
+                            seq,
+                            offset: std::io::SeekFrom::Start(offset),
+                            chunk_id,
+                        })
+                    }
+                    _ => return Err(NdnError::InvalidData("unknown item_type".into())),
+                };
+                Ok(StorageItemDetail {
+                    item_id: id,
+                    item,
+                    parent_id: parent_id.unwrap_or_default(),
+                    status,
+                    parent_path: PathBuf::from(parent_path),
+                    depth: depth as u64,
+                })
+            })
+            .await
+            .map_err(|e| NdnError::IoError(e.to_string()))?
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for SqliteStorage {
+        type ItemId = i64;
+
+        async fn create_new_item(
+            &self,
+            item: &StorageItem,
+            depth: PathDepth,
+            parent_path: &Path,
+            parent_item_id: Option<Self::ItemId>,
+        ) -> NdnResult<StorageItemDetail<Self::ItemId>> {
+            let item_clone = item.clone();
+            let parent_path = parent_path.to_path_buf();
+            let conn = self.inner.clone();
+            let status = match item {
+                StorageItem::Dir(_) => ItemStatus::New,
+                StorageItem::File(_) => ItemStatus::New,
+                StorageItem::Chunk(_) => ItemStatus::New,
+            };
+            let status_kind = Self::status_kind(&status).to_string();
+            let status_json = Self::serialize_status(&status)?;
+            let (item_type, name_opt, chunk_seq, data_json) = match &item_clone {
+                StorageItem::Dir(d) => (
+                    "dir",
+                    Some(d.name.clone()),
+                    None,
+                    Some(ser_json(d)?), // store object
+                ),
+                StorageItem::File(f) => (
+                    "file",
+                    Some(f.obj.name.clone()),
+                    None,
+                    Some(ser_json(&f.obj)?),
+                ),
+                StorageItem::Chunk(c) => {
+                    let mut meta = serde_json::Map::new();
+                    if let Some(id) = &c.chunk_id {
+                        meta.insert(
+                            "chunk_id".into(),
+                            serde_json::Value::String(id.to_obj_id().to_string()),
+                        );
+                    }
+                    if let std::io::SeekFrom::Start(off) = c.offset {
+                        meta.insert("offset".into(), serde_json::Value::Number(off.into()));
+                    }
+                    (
+                        "chunk",
+                        None,
+                        Some(c.seq as i64),
+                        Some(serde_json::Value::Object(meta).to_string()),
+                    )
+                }
+            };
+            let parent_path_str = parent_path.display().to_string();
+            let id = tokio::task::spawn_blocking(move || -> NdnResult<i64> {
+                let conn = conn.lock().unwrap();
+                conn.execute(
+                    "INSERT INTO items(parent_id,item_type,name,chunk_seq,data_json,status_kind,status_json,parent_path,depth)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                    params![
+                        parent_item_id,
+                        item_type,
+                        name_opt,
+                        chunk_seq,
+                        data_json,
+                        status_kind,
+                        status_json,
+                        parent_path_str,
+                        depth as i64
+                    ],
+                )
+                .map_err(|e| NdnError::IoError(e.to_string()))?;
+                Ok(conn.last_insert_rowid())
+            })
+            .await
+            .map_err(|e| NdnError::IoError(e.to_string()))??;
+
+            self.row_to_detail(id).await
+        }
+
+        async fn begin_transaction(&self) -> NdnResult<()> {
+            let conn = self.inner.clone();
+            let flag = self.tx_flag.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut f = flag.lock().unwrap();
+                if !*f {
+                    conn.lock()
+                        .unwrap()
+                        .execute_batch("BEGIN IMMEDIATE")
+                        .map_err(|e| NdnError::IoError(e.to_string()))?;
+                    *f = true;
+                }
+                Ok::<_, NdnError>(())
+            })
+            .await
+            .map_err(|e| NdnError::IoError(e.to_string()))??;
+            Ok(())
+        }
+
+        async fn commit_transaction(&self) -> NdnResult<()> {
+            let conn = self.inner.clone();
+            let flag = self.tx_flag.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut f = flag.lock().unwrap();
+                if *f {
+                    conn.lock()
+                        .unwrap()
+                        .execute_batch("COMMIT")
+                        .map_err(|e| NdnError::IoError(e.to_string()))?;
+                    *f = false;
+                }
+                Ok::<_, NdnError>(())
+            })
+            .await
+            .map_err(|e| NdnError::IoError(e.to_string()))??;
+            Ok(())
+        }
+
+        async fn rollback_transaction(&self) -> NdnResult<()> {
+            let conn = self.inner.clone();
+            let flag = self.tx_flag.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut f = flag.lock().unwrap();
+                if *f {
+                    conn.lock()
+                        .unwrap()
+                        .execute_batch("ROLLBACK")
+                        .map_err(|e| NdnError::IoError(e.to_string()))?;
+                    *f = false;
+                }
+                Ok::<_, NdnError>(())
+            })
+            .await
+            .map_err(|e| NdnError::IoError(e.to_string()))??;
+            Ok(())
+        }
+
+        async fn begin_hash(&self, key: &ItemSelectKey<Self::ItemId>) -> NdnResult<()> {
+            let key = key.clone();
+            let conn = self.inner.clone();
+            tokio::task::spawn_blocking(move || {
+                let target_status = SqliteStorage::serialize_status(&ItemStatus::Hashing)
+                    .expect("serialize status should not fail");
+                let (sql, param) = match key {
+                    ItemSelectKey::ItemId(id) => (
+                        "UPDATE items SET status_kind='Hashing', status_json=?1 WHERE id=?2 AND (status_kind='New' OR status_kind='Scanning')",
+                        params![target_status, id.clone()],
+                    ),
+                    ItemSelectKey::Child(parent_id, child_name) => {
+                        match child_name {
+                            StorageItemName::Name(name) => (
+                                "UPDATE items SET status_kind='Hashing', status_json=?1 WHERE parent_id=?2 AND name=?3 AND (status_kind='New' OR status_kind='Scanning')",
+                                params![target_status, parent_id.clone(), name.clone()],
+                            ),
+                            StorageItemName::ChunkSeq(seq) => (
+                                "UPDATE items SET status_kind='Hashing', status_json=?1 WHERE parent_id=?2 AND chunk_seq=?3 AND (status_kind='New' OR status_kind='Scanning')",
+                                params![target_status, parent_id.clone(), seq.clone()],
+                            ),
+                        }
+                    }
+                };
+
+                let conn = conn.lock().unwrap();
+                conn.execute(sql, param)
+                    .map_err(|e| NdnError::IoError(e.to_string()))?;
+                Ok::<_, NdnError>(())
+            })
+            .await
+            .map_err(|e| NdnError::IoError(e.to_string()))??;
+            Ok(())
+        }
+
+        async fn begin_transfer(
+            &self,
+            key: &ItemSelectKey<Self::ItemId>,
+            obj_id: &ObjId,
+            content_header: Option<&serde_json::Value>,
+        ) -> NdnResult<Option<ContentLine>> {
+            /**
+             * 1. 先把所有children检索出来，构造ContentLine，dir构造成ContentLine::ObjMap，file构造成ContentLine::ObjArray，chunk直接构造为ContentLine::Chunk，可直接由obj_id判定对象类型
+             * 2. 再用构造出的ContentLine构造 ItemStatus::Transfer状态
+             * 3. 更新items表的status_kind为Transfer，status_json为ItemStatus::Transfer的序列化结果
+             * 4. 返回ContentLine
+             */
+            let (children, parent_path) = self
+                .list_children_order_by_child_seq(key, None, None)
+                .await?;
+            let content_line = match obj_id.obj_type.as_str() {
+                OBJ_TYPE_DIR => {
+                    let mut sub_map = HashMap::new();
+                    for child in children {
+                        sub_map.insert(
+                            child.item.name().check_name().to_string(),
+                            child.status.check_complete().line_index,
+                        );
+                    }
+                    ContentLine::Map(ObjMapLine::MemoryWithIndex(sub_map))
+                }
+                OBJ_TYPE_FILE => {
+                    let mut sub_array = Vec::new();
+                    let mut last_range = None;
+                    for child in children {
+                        let sub_index = child.status.check_complete().line_index;
+                        match last_range.clone() {
+                            Some((start, end)) => {
+                                if end == sub_index {
+                                    last_range = Some((start, end + 1));
+                                } else {
+                                    if start + 1 == end {
+                                        sub_array.push(ObjArraySubObjIndex::Index(start));
+                                    } else {
+                                        sub_array.push(ObjArraySubObjIndex::Range(start..end));
+                                    }
+                                    last_range = None;
+                                }
+                            }
+                            None => {
+                                last_range = Some((sub_index, sub_index + 1));
+                            }
+                        }
+                    }
+
+                    ContentLine::Array(ObjArrayLine::Lines(sub_array))
+                }
+                _ if obj_id.is_chunk() => ContentLine::Chunk(ChunkId::from_obj_id(obj_id)),
+                _ => return Err(NdnError::InvalidData("unknown object type".into())),
+            };
+
+            let content_line_json_str =
+                serde_json::to_string(&content_line_to_json(&content_line)?).unwrap();
+            let content_header_json_str = content_header.map(|v| serde_json::to_string(v).unwrap());
+
+            let target_status = ItemStatus::Transfer(super::dir_backup::TransferStatusDesc {
+                obj_id: obj_id.clone(),
+                content_header: content_header.cloned(),
+                content_line: Some(content_line.clone()),
+            });
+
+            let status_json = SqliteStorage::serialize_status(&target_status)?;
+            let key = key.clone();
+
+            let conn = self.inner.clone();
+            tokio::task::spawn_blocking(move || {
+                let (sql, params) = match key {
+                    ItemSelectKey::ItemId(id) => (
+                        "UPDATE items SET status_kind='Transfer', status_json=?1, content_header_json=?2, content_line_json=?3 WHERE id=?4 AND status_kind='Hashing'",
+                        params![
+                            status_json,
+                            content_header_json_str.map_or(rusqlite::types::Value::Null, |v| rusqlite::types::Value::Text(v)),
+                            content_line_json_str,
+                            id.clone()
+                        ],
+                    ),
+                    ItemSelectKey::Child(parent_id, child_name) => {
+                        match child_name {
+                            StorageItemName::Name(name) => (
+                                "UPDATE items SET status_kind='Transfer', status_json=?1, content_header_json=?2, content_line_json=?3 WHERE parent_id=?4 AND name=?5 AND status_kind='Hashing'",
+                                params![
+                                    status_json,
+                                    content_header_json_str.map_or(rusqlite::types::Value::Null, |v| rusqlite::types::Value::Text(v)),
+                                    content_line_json_str,
+                                    parent_id.clone(),
+                                    name.clone()
+                                ],
+                            ),
+                            StorageItemName::ChunkSeq(seq) => (
+                                "UPDATE items SET status_kind='Transfer', status_json=?1, content_header_json=?2, content_line_json=?3 WHERE parent_id=?4 AND chunk_seq=?5 AND status_kind='Hashing'",
+                                params![
+                                    status_json,
+                                    content_header_json_str.map_or(rusqlite::types::Value::Null, |v| rusqlite::types::Value::Text(v)),
+                                    content_line_json_str,
+                                    parent_id.clone(),
+                                    seq.clone()
+                                ],
+                            ),
+                        }
+                    }
+                };
+
+                let conn_lk = conn.lock().unwrap();
+                conn_lk
+                    .execute(sql, params)
+                    .map_err(|e| NdnError::IoError(e.to_string()))?;
+                Ok::<_, NdnError>(())
+            })
+            .await
+            .map_err(|e| NdnError::IoError(e.to_string()))??;
+            Ok(Some(content_line))
+        }
+
+        async fn complete(
+            &self,
+            key: &ItemSelectKey<Self::ItemId>,
+            line_index: packed_obj_pipeline::demo::LineIndex,
+            container_line_index: Option<ContainerLineIndex>,
+        ) -> NdnResult<()> {
+            /**
+             * 1. 状态必须从Transfer变为Complete，先从Transfer状态里读出CompleteStatusDesc需要的参数
+             * 2. 更新items表的status_kind为Complete，status_json为CompleteStatusDesc的序列化结果
+             */
+            let item = self.get_item(key).await?;
+            let status = match item.status {
+                ItemStatus::Transfer(tsd) => {
+                    ItemStatus::Complete(super::dir_backup::CompleteStatusDesc {
+                        obj_id: tsd.obj_id,
+                        content_header: tsd.content_header,
+                        content_line: tsd.content_line,
+                        line_index,
+                        container_line_index,
+                    })
+                }
+                _ => {
+                    return Err(NdnError::InvalidData(
+                        "complete called on non-Transfer item".into(),
+                    ))
+                }
+            };
+            let status_json = SqliteStorage::serialize_status(&status)?;
+            let key = key.clone();
+            let conn = self.inner.clone();
+            tokio::task::spawn_blocking(move || {
+                let (sql, params) = match key {
+                    ItemSelectKey::ItemId(id) => (
+                        "UPDATE items SET status_kind='Complete', status_json=?1 WHERE id=?2 AND status_kind='Transfer'",
+                        params![status_json, id.clone()],
+                    ),
+                    ItemSelectKey::Child(parent_id, child_name) => {
+                        match child_name {
+                            StorageItemName::Name(name) => (
+                                "UPDATE items SET status_kind='Complete', status_json=?1 WHERE parent_id=?2 AND name=?3 AND status_kind='Transfer'",
+                                params![status_json, parent_id.clone(), name.clone()],
+                            ),
+                            StorageItemName::ChunkSeq(seq) => (
+                                "UPDATE items SET status_kind='Complete', status_json=?1 WHERE parent_id=?2 AND chunk_seq=?3 AND status_kind='Transfer'",
+                                params![status_json, parent_id.clone(), seq.clone()],
+                            ),
+                        }
+                    }
+                };
+
+                let conn_lk = conn.lock().unwrap();
+                conn_lk
+                    .execute(sql, params)
+                    .map_err(|e| NdnError::IoError(e.to_string()))?;
+                Ok::<_, NdnError>(())
+            })
+            .await
+            .map_err(|e| NdnError::IoError(e.to_string()))??;
+            Ok(())
+        }
+
+        async fn get_root(&self) -> NdnResult<StorageItemDetail<Self::ItemId>> {
+            let conn = self.inner.clone();
+            let id_opt = tokio::task::spawn_blocking(move || -> NdnResult<Option<i64>> {
+                let conn_lk = conn.lock().unwrap();
+                let mut stmt = conn_lk
+                    .prepare("SELECT id FROM items WHERE parent_id IS NULL ORDER BY id LIMIT 1")
+                    .map_err(|e| NdnError::IoError(e.to_string()))?;
+                let id: Option<i64> = stmt
+                    .query_row([], |r| r.get(0))
+                    .map_err(|e| NdnError::IoError(e.to_string()))?;
+                Ok(id)
+            })
+            .await
+            .map_err(|e| NdnError::IoError(e.to_string()))??;
+            let id = id_opt.ok_or_else(|| NdnError::NotFound("root not found".into()))?;
+            self.row_to_detail(id).await
+        }
+
+        async fn get_item(
+            &self,
+            key: &ItemSelectKey<Self::ItemId>,
+        ) -> NdnResult<StorageItemDetail<Self::ItemId>> {
+            let key = key.clone();
+            let conn = self.inner.clone();
+            tokio::task::spawn_blocking(move || -> NdnResult<_> {
+                let (sql, params) = match key {
+                    ItemSelectKey::ItemId(id) => (
+                        "SELECT id,parent_id,item_type,name,chunk_seq,data_json,status_json,parent_path,depth,
+                                obj_id,content_header_json,content_line_json,line_index,
+                                container_content_index,container_header_index
+                        FROM items WHERE id=?1",
+                        params![id.clone()],
+                    ),
+                    ItemSelectKey::Child(parent_id, child_name) => {
+                        match child_name {
+                            StorageItemName::Name(name) => (
+                                "SELECT id,parent_id,item_type,name,chunk_seq,data_json,status_json,parent_path,depth,
+                                        obj_id,content_header_json,content_line_json,line_index,
+                                        container_content_index,container_header_index
+                                FROM items WHERE parent_id=?1 AND name=?2",
+                                params![parent_id.clone(), name.clone()],
+                            ),
+                            StorageItemName::ChunkSeq(seq) => (
+                                "SELECT id,parent_id,item_type,name,chunk_seq,data_json,status_json,parent_path,depth,
+                                        obj_id,content_header_json,content_line_json,line_index,
+                                        container_content_index,container_header_index
+                                FROM items WHERE parent_id=?1 AND chunk_seq=?2",
+                                params![parent_id.clone(), seq.clone()],
+                            ),
+                        }
+                    }
+                };
+
+                let conn_lk = conn.lock().unwrap();
+                let mut stmt = conn_lk
+                    .prepare(sql)
+                    .map_err(|e| NdnError::IoError(e.to_string()))?;
+                let row = stmt
+                    .query_row(params, |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, Option<i64>>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, Option<String>>(3)?,
+                            r.get::<_, Option<i64>>(4)?,
+                            r.get::<_, Option<String>>(5)?,
+                            r.get::<_, String>(6)?,
+                            r.get::<_, String>(7)?,
+                            r.get::<_, i64>(8)?,
+                            r.get::<_, Option<String>>(9)?,
+                            r.get::<_, Option<String>>(10)?,
+                            r.get::<_, Option<String>>(11)?,
+                            r.get::<_, Option<i64>>(12)?,
+                            r.get::<_, Option<i64>>(13)?,
+                            r.get::<_, Option<i64>>(14)?,
+                        ))
+                    })
+                    .optional()
+                    .map_err(|e| NdnError::IoError(e.to_string()))?
+                    .ok_or_else(|| NdnError::NotFound("item not found".into()))?;
+                let (
+                    id,
+                    parent_id,
+                    item_type,
+                    name_opt,
+                    chunk_seq_opt,
+                    data_json,
+                    status_json,
+                    parent_path,
+                    depth,
+                    _obj_id,
+                    _hdr_json,
+                    _cl_json,
+                    _line_index,
+                    _c_content,
+                    _c_header,
+                ) = row;
+                let status = SqliteStorage::deserialize_status(&status_json)?;
+                let item = match item_type.as_str() {
+                    "dir" => {
+                        let dir: DirObject = de_json(&data_json.unwrap_or_default())?;
+                        StorageItem::Dir(dir)
+                    }
+                    "file" => {
+                        let file: FileObject = de_json(&data_json.unwrap_or_default())?;
+                        StorageItem::File(super::dir_backup::FileStorageItem {
+                            obj: file,
+                            chunk_size: None,
+                        })
+                    }
+                    "chunk" => {
+                        let meta_v: serde_json::Value = de_json(&data_json.unwrap_or_else(|| "{}".into()))?;
+                        let seq = chunk_seq_opt.unwrap_or(0) as u64;
+                        let offset = meta_v
+                            .get("offset")
+                            .and_then(|x| x.as_u64())
+                            .unwrap_or(seq * 0);
+                        let chunk_id = meta_v
+                            .get("chunk_id")
+                            .and_then(|x| x.as_str())
+                            .and_then(|s| ObjId::try_from(s).ok())
+                            .map(|oid| crate::ChunkId::from_obj_id(&oid));
+                        StorageItem::Chunk(super::dir_backup::ChunkItem {
+                            seq,
+                            offset: std::io::SeekFrom::Start(offset),
+                            chunk_id,
+                        })
+                    }
+                    _ => return Err(NdnError::InvalidData("unknown item_type".into())),
+                };
+                Ok(StorageItemDetail {
+                    item_id: id,
+                    item,
+                    parent_id: parent_id.unwrap_or_default(),
+                    status,
+                    parent_path: PathBuf::from(parent_path),
+                    depth: depth as u64,
+                })
+            })
+            .await
+            .map_err(|e| NdnError::IoError(e.to_string()))?
+        }
+
+        async fn get_uncomplete_dir_or_file_with_max_depth_min_child_seq(
+            &self,
+        ) -> NdnResult<Option<StorageItemDetail<Self::ItemId>>> {
+            let conn = self.inner.clone();
+            tokio::task::spawn_blocking(move || -> NdnResult<_> {
+                let conn_lk = conn.lock().unwrap();
+                let mut stmt = conn_lk.prepare(
+                    "SELECT id,parent_id,item_type,name,chunk_seq,data_json,status_json,parent_path,depth,
+                            obj_id,content_header_json,content_line_json,line_index,
+                            container_content_index,container_header_index
+                     FROM items WHERE status_kind!='Complete' AND item_type IN ('dir', 'file')
+                     ORDER BY depth DESC, chunk_seq ASC, name ASC LIMIT 1",
+                ).map_err(|e| NdnError::IoError(e.to_string()))?;
+                let row = stmt.query_row([], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, Option<i64>>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, Option<i64>>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                        r.get::<_, String>(6)?,
+                        r.get::<_, String>(7)?,
+                        r.get::<_, i64>(8)?,
+                        r.get::<_, Option<String>>(9)?,
+                        r.get::<_, Option<String>>(10)?,
+                        r.get::<_, Option<String>>(11)?,
+                        r.get::<_, Option<i64>>(12)?,
+                        r.get::<_, Option<i64>>(13)?,
+                        r.get::<_, Option<i64>>(14)?,
+                    ))
+                }).optional()
+                .map_err(|e| NdnError::IoError(e.to_string()))?;
+
+                if let Some(row) = row {
+                    let (
+                        id,
+                        parent_id,
+                        item_type,
+                        name_opt,
+                        chunk_seq_opt,
+                        data_json,
+                        status_json,
+                        parent_path,
+                        depth,
+                        _obj_id,
+                        _hdr_json,
+                        _cl_json,
+                        _line_index,
+                        _c_content,
+                        _c_header,
+                    ) = row;
+                    let status = SqliteStorage::deserialize_status(status_json.as_str())?;
+                    let item = match item_type.as_str() {
+                        "dir" => {
+                            let dir: DirObject = de_json(&data_json.unwrap_or_default())?;
+                            StorageItem::Dir(dir)
+                        }
+                        "file" => {
+                            let file: FileObject = de_json(&data_json.unwrap_or_default())?;
+                            StorageItem::File(super::dir_backup::FileStorageItem {
+                                obj: file,
+                                chunk_size: None,
+                            })
+                        }
+                        "chunk" => {
+                            unreachable!("get_uncomplete_dir_or_file_with_max_depth_min_child_seq should not return chunk item");
+                        }
+                        _ => return Err(NdnError::InvalidData("unknown item_type".into())),
+                    };
+                    Ok(Some(StorageItemDetail {
+                        item_id: id,
+                        item,
+                        parent_id: parent_id.unwrap_or_default(),
+                        status,
+                        parent_path: PathBuf::from(parent_path),
+                        depth: depth as u64,
+                    }))
+                } else {
+                    Ok(None)
+                }
+            })
+            .await
+            .map_err(|e| NdnError::IoError(e.to_string()))?
+        }
+
+        async fn list_children_order_by_child_seq(
+            &self,
+            parent_key: &ItemSelectKey<Self::ItemId>,
+            _offset: Option<u64>,
+            _limit: Option<u64>,
+        ) -> NdnResult<(Vec<StorageItemDetail<Self::ItemId>>, PathBuf)> {
+            let parent_key = parent_key.clone();
+            let conn = self.inner.clone();
+            let (items, parent_path) = tokio::task::spawn_blocking(move || -> NdnResult<_> {
+                let (sql, params) = match parent_key {
+                    ItemSelectKey::ItemId(id) => (
+                        "SELECT id,parent_id,item_type,name,chunk_seq,data_json,status_json,parent_path,depth,
+                                obj_id,content_header_json,content_line_json,line_index,
+                                container_content_index,container_header_index
+                        FROM items WHERE parent_id=?1 ORDER BY chunk_seq ASC, name ASC",
+                        params![id.clone()],
+                    ),
+                    ItemSelectKey::Child(parent_id, child_name) => {
+                        match child_name {
+                            StorageItemName::Name(name) => (
+                                "SELECT id,parent_id,item_type,name,chunk_seq,data_json,status_json,parent_path,depth,
+                                        obj_id,content_header_json,content_line_json,line_index,
+                                        container_content_index,container_header_index
+                                FROM items WHERE parent_id=?1 AND name=?2 ORDER BY chunk_seq ASC",
+                                params![parent_id.clone(), name.clone()],
+                            ),
+                            StorageItemName::ChunkSeq(seq) => (
+                                "SELECT id,parent_id,item_type,name,chunk_seq,data_json,status_json,parent_path,depth,
+                                        obj_id,content_header_json,content_line_json,line_index,
+                                        container_content_index,container_header_index
+                                FROM items WHERE parent_id=?1 AND chunk_seq=?2 ORDER BY chunk_seq ASC",
+                                params![parent_id.clone(), seq.clone()],
+                            ),
+                        }
+                    }
+                };
+                let conn_lk = conn.lock().unwrap();
+                let mut stmt = conn_lk
+                    .prepare(sql)
+                    .map_err(|e| NdnError::IoError(e.to_string()))?;
+                let rows = stmt
+                    .query_map(params, |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, Option<i64>>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, Option<String>>(3)?,
+                            r.get::<_, Option<i64>>(4)?,
+                            r.get::<_, Option<String>>(5)?,
+                            r.get::<_, String>(6)?,
+                            r.get::<_, String>(7)?,
+                            r.get::<_, i64>(8)?,
+                            r.get::<_, Option<String>>(9)?,
+                            r.get::<_, Option<String>>(10)?,
+                            r.get::<_, Option<String>>(11)?,
+                            r.get::<_, Option<i64>>(12)?,
+                            r.get::<_, Option<i64>>(13)?,
+                            r.get::<_, Option<i64>>(14)?,
+                        ))
+                    })
+                    .map_err(|e| NdnError::IoError(e.to_string()))?;
+                let mut items = Vec::new();
+                let mut parent_path = PathBuf::new();
+                for row in rows {
+                    let (
+                        id,
+                        parent_id,
+                        item_type,
+                        name_opt,
+                        chunk_seq_opt,
+                        data_json,
+                        status_json,
+                        parent_path_str,
+                        depth,
+                        _obj_id,
+                        _hdr_json,
+                        _cl_json,
+                        _line_index,
+                        _c_content,
+                        _c_header,
+                    ) = row.map_err(|err| NdnError::IoError(err.to_string()))?;
+                    let status = SqliteStorage::deserialize_status(&status_json)?;
+                    let item = match item_type.as_str() {
+                        "dir" => {
+                            let dir: DirObject = de_json(&data_json.unwrap_or_default())?;
+                            StorageItem::Dir(dir)
+                        }
+                        "file" => {
+                            let file: FileObject = de_json(&data_json.unwrap_or_default())?;
+                            StorageItem::File(super::dir_backup::FileStorageItem {
+                                obj: file,
+                                chunk_size: None,
+                            })
+                        }
+                        "chunk" => {
+                            let meta_v: serde_json::Value =
+                                de_json(&data_json.unwrap_or_else(|| "{}".into()))?;
+                            let seq = chunk_seq_opt.unwrap_or(0) as u64;
+                            let offset = meta_v
+                                .get("offset")
+                                .and_then(|x| x.as_u64())
+                                .unwrap_or(seq * 0);
+                            let chunk_id = meta_v
+                                .get("chunk_id")
+                                .and_then(|x| x.as_str())
+                                .and_then(|s| ObjId::try_from(s).ok())
+                                .map(|oid| crate::ChunkId::from_obj_id(&oid));
+                            StorageItem::Chunk(super::dir_backup::ChunkItem {
+                                seq,
+                                offset: std::io::SeekFrom::Start(offset),
+                                chunk_id,
+                            })
+                        }
+                        _ => return Err(NdnError::InvalidData("unknown item_type".into())),
+                    };
+                    if parent_path_str.is_empty() {
+                        parent_path = PathBuf::new();
+                    } else {
+                        parent_path = PathBuf::from(parent_path_str);
+                    }
+                    items.push(StorageItemDetail {
+                        item_id: id,
+                        item,
+                        parent_id: parent_id.unwrap_or_default(),
+                        status,
+                        parent_path: parent_path.clone(),
+                        depth: depth as u64,
+                    });
+                }
+                Ok((items, parent_path))
+            })
+            .await
+            .map_err(|e| NdnError::IoError(e.to_string()))??;
+            Ok((items, parent_path))
+        }
     }
 }
