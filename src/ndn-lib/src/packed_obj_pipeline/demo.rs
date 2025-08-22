@@ -344,6 +344,7 @@ pub struct AppInfo {
     pub name: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EndReason {
     Abort,
     Complete,
@@ -377,6 +378,7 @@ pub trait ReaderListener {
     async fn wait(&mut self) -> NdnResult<ReaderEvent>;
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ReaderEvent {
     NeedLine(Vec<LineIndex>),
     NeedObject(Vec<(ObjId, LineIndex)>),
@@ -439,6 +441,7 @@ mod pipeline_sim {
     //     如果`with_children`为`true`，则意味着这个对象是`ObjArray`/`ObjMap`，找到该对象并找到各相关行，忽略这些相关行；
     // 提供`line_at`/`object_by_id`要求写队列立即发送指定元素到读队列中，由`next_line`接口返回, 并设定`read`标志， 如果设定了等待事件`Receiver`，在`next_line`接口读取到它时唤醒对应的事件；
     use super::*;
+    use bincode::de;
     use std::collections::VecDeque;
     use std::sync::Arc;
     use tokio::sync::mpsc::{self, Receiver, Sender};
@@ -688,16 +691,19 @@ mod pipeline_sim {
         }
     }
 
+    #[derive(Clone)]
     pub struct SimWriter {
         inner: Arc<Mutex<Inner>>,
         notify: Arc<tokio::sync::Notify>,
     }
 
+    #[derive(Clone)]
     pub struct SimWriterFeedback {
         inner: Arc<Mutex<Inner>>,
         notify: Arc<tokio::sync::Notify>,
     }
 
+    #[derive(Clone)]
     pub struct SimReader {
         inner: Arc<Mutex<Inner>>,
         notify: Arc<tokio::sync::Notify>,
@@ -1111,12 +1117,7 @@ mod pipeline_sim {
     }
 
     // Public helper to construct the simulation pipeline.
-    pub fn new_pipeline_sim() -> (
-        impl Writer,
-        impl Reader,
-        impl WriterFeedback,
-        impl ReaderListener,
-    ) {
+    pub fn new_pipeline_sim() -> (SimWriter, SimReader, SimWriterFeedback, SimReaderListener) {
         SimPipeline::new()
     }
 }
@@ -1534,12 +1535,10 @@ mod dir_backup {
         F: FileSystemReader<FDR, FFR> + 'static,
         NW: NdnWriter + 'static,
         PW: crate::packed_obj_pipeline::demo::Writer + Clone + 'static,
-        PRL: crate::packed_obj_pipeline::demo::ReaderListener + 'static,
     >(
         path: Option<&Path>, // None for continue
         ndn_writer: NW,
         mut pipeline_writer: PW,
-        mut pipeline_reader_listener: PRL,
         reader: F,
         storage: S,
         chunk_size: u64,
@@ -2133,7 +2132,7 @@ mod dir_backup {
             }
         }
 
-        pipeline_reader_listener.wait().await?;
+        
 
         let root_item = storage.get_root().await?;
         assert_eq!(root_item.depth, 0, "root item depth should be 0.");
@@ -3210,20 +3209,33 @@ mod dir_restore {
 mod backup_app {
 
     use std::{
-        collections::{btree_map::Range, HashMap},
+        collections::{btree_map::Range, HashMap, VecDeque},
+        io::SeekFrom,
         path::{Path, PathBuf},
         sync::Arc,
     };
 
     use rusqlite::{params, OptionalExtension};
-    use tokio::sync::Mutex;
+    use tokio::{
+        io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+        sync::Mutex,
+        task::JoinHandle,
+    };
 
     use crate::{
         packed_obj_pipeline::{
             self,
-            demo::{ObjArrayLine, ObjArraySubObjIndex, ObjMapLine},
+            demo::{
+                dir_backup::{
+                    file_system_to_ndn, FileSystemDirReader, FileSystemFileReader,
+                    FileSystemFileWriter, FileSystemItem, FileSystemReader, FileSystemWriter,
+                    NdnWriter,
+                },
+                pipeline_sim, EndReason, LineIndex, ObjArrayLine, ObjArraySubObjIndex, ObjMapLine,
+                Reader, ReaderEvent, ReaderListener,
+            },
         },
-        ChunkId, FileObject, NdnError, NdnResult, ObjId, OBJ_TYPE_DIR, OBJ_TYPE_FILE,
+        ChunkId, FileObject, NamedDataMgr, NdnError, NdnResult, ObjId, OBJ_TYPE_DIR, OBJ_TYPE_FILE,
     };
 
     use super::dir_backup::{
@@ -3350,6 +3362,107 @@ mod backup_app {
                 inner: Arc::new(std::sync::Mutex::new(conn)),
                 tx_flag: Arc::new(std::sync::Mutex::new(false)),
             })
+        }
+
+        pub async fn get_items_by_line_index(
+            &self,
+            line_index: &[LineIndex],
+        ) -> NdnResult<Vec<StorageItemDetail<i64>>> {
+            let conn = self.inner.clone();
+            let mut conn_guard = conn.lock().unwrap();
+            let mut stmt = conn_guard.prepare(
+                "SELECT id,parent_id,item_type,name,chunk_seq,data_json,status_json,parent_path,depth,
+                        obj_id,content_header_json,content_line_json,line_index,
+                        container_content_index,container_header_index
+                    FROM items WHERE line_index IN (?1)",
+            )
+            .map_err(|e| NdnError::IoError(e.to_string()))?;
+
+            let line_index_str: Vec<String> = line_index.iter().map(|x| x.to_string()).collect();
+            let rows = stmt
+                .query_map(params![line_index_str.join(",")], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, Option<i64>>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, Option<i64>>(4)?,
+                        r.get::<_, String>(5)?,
+                        r.get::<_, String>(6)?,
+                        r.get::<_, String>(7)?,
+                        r.get::<_, i64>(8)?,
+                        r.get::<_, Option<String>>(9)?,
+                        r.get::<_, Option<String>>(10)?,
+                        r.get::<_, Option<String>>(11)?,
+                        r.get::<_, Option<i64>>(12)?,
+                        r.get::<_, Option<i64>>(13)?,
+                        r.get::<_, Option<i64>>(14)?,
+                    ))
+                })
+                .map_err(|e| NdnError::IoError(e.to_string()))?;
+
+            let mut items = Vec::new();
+            for row in rows {
+                let (
+                    id,
+                    parent_id,
+                    item_type,
+                    name_opt,
+                    chunk_seq_opt,
+                    data_json,
+                    status_json,
+                    parent_path,
+                    depth,
+                    _obj_id,
+                    _hdr_json,
+                    _cl_json,
+                    _line_index,
+                    _c_content,
+                    _c_header,
+                ) = row.map_err(|err| NdnError::IoError(err.to_string()))?;
+                let status = Self::deserialize_status(status_json.as_str())?;
+                let item = match item_type.as_str() {
+                    "dir" => {
+                        let dir: DirObject = de_json(&data_json)?;
+                        StorageItem::Dir(dir)
+                    }
+                    "file" => {
+                        let file: FileObject = de_json(&data_json)?;
+                        StorageItem::File(super::dir_backup::FileStorageItem {
+                            obj: file,
+                            chunk_size: None,
+                        })
+                    }
+                    "chunk" => {
+                        let meta_v: serde_json::Value = de_json(&data_json)?;
+                        let seq = chunk_seq_opt.unwrap_or(0) as u64;
+                        let offset = meta_v
+                            .get("offset")
+                            .and_then(|x| x.as_u64())
+                            .unwrap_or(seq * 0);
+                        let chunk_id = meta_v
+                            .get("chunk_id")
+                            .and_then(|x| x.as_str())
+                            .and_then(|s| ObjId::try_from(s).ok())
+                            .map(|oid| crate::ChunkId::from_obj_id(&oid));
+                        StorageItem::Chunk(super::dir_backup::ChunkItem {
+                            seq,
+                            offset: std::io::SeekFrom::Start(offset),
+                            chunk_id,
+                        })
+                    }
+                    _ => return Err(NdnError::InvalidData("unknown item_type".into())),
+                };
+                items.push(StorageItemDetail {
+                    item_id: id,
+                    item,
+                    parent_id: parent_id.unwrap_or_default(),
+                    status,
+                    parent_path: PathBuf::from(parent_path),
+                    depth: depth as u64,
+                });
+            }
+            Ok(items)
         }
 
         fn status_kind(s: &ItemStatus) -> &'static str {
@@ -4183,5 +4296,522 @@ mod backup_app {
             .map_err(|e| NdnError::IoError(e.to_string()))??;
             Ok((items, parent_path))
         }
+    }
+
+    // ===== Local filesystem implementations of FileSystem* traits =====
+    fn io_err<E: std::fmt::Display>(e: E) -> NdnError {
+        NdnError::IoError(e.to_string())
+    }
+
+    #[derive(Clone)]
+    pub struct LocalFsReader;
+
+    #[derive(Clone)]
+    pub struct LocalDirReader {
+        reader: Arc<Mutex<tokio::fs::ReadDir>>,
+    }
+
+    #[derive(Clone)]
+    pub struct LocalFileReader {
+        path: PathBuf,
+        file: Arc<Mutex<tokio::fs::File>>,
+    }
+
+    #[derive(Clone)]
+    pub struct LocalFsWriter;
+
+    #[derive(Clone)]
+    pub struct LocalFileWriter {
+        path: PathBuf,
+        file: Arc<Mutex<tokio::fs::File>>,
+    }
+
+    impl LocalFsReader {
+        pub fn new() -> Self {
+            Self
+        }
+    }
+
+    impl LocalFsWriter {
+        pub fn new() -> Self {
+            Self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FileSystemDirReader for LocalDirReader {
+        async fn next(&self, limit: Option<u64>) -> NdnResult<Vec<FileSystemItem>> {
+            let limit = limit.unwrap_or(u64::MAX) as usize;
+            if limit == 0 {
+                return Ok(Vec::new());
+            }
+            let mut out = Vec::with_capacity(limit);
+            loop {
+                let mut reader = self.reader.lock().await;
+
+                match reader.next_entry().await {
+                    Ok(Some(entry)) => {
+                        let path = entry.path();
+                        let meta = tokio::fs::metadata(&path).await.map_err(io_err)?;
+                        let name = path
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .ok_or_else(|| NdnError::InvalidData("invalid unicode name".into()))?
+                            .to_string();
+
+                        if meta.is_dir() {
+                            out.push(FileSystemItem::Dir(DirObject {
+                                name,
+                                content: String::new(),
+                                exp: 0,
+                                meta: None,
+                                owner: None,
+                                create_time: None,
+                                extra_info: HashMap::new(),
+                            }));
+                        } else if meta.is_file() {
+                            out.push(FileSystemItem::File(FileObject::new(
+                                name,
+                                meta.len(),
+                                String::new(),
+                            )));
+                        } else {
+                            return Err(NdnError::InvalidData("unsupported fs entry type".into()));
+                        }
+                        if out.len() >= limit {
+                            break; // Reached the limit
+                        }
+                    }
+                    Ok(None) => break, // No more entries
+                    Err(e) => return Err(io_err(e)),
+                }
+            }
+            Ok(out)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FileSystemFileReader for LocalFileReader {
+        async fn read_chunk(&self, offset: SeekFrom, limit: Option<u64>) -> NdnResult<Vec<u8>> {
+            let file = self.file.clone();
+            let mut f = file.lock().await;
+            f.seek(offset).await.map_err(io_err)?;
+            let mut buf = Vec::new();
+            match limit {
+                Some(limit) => {
+                    buf.resize(limit as usize, 0);
+                    let n = f.read(&mut buf).await.map_err(io_err)?;
+                    buf.truncate(n);
+                }
+                None => {
+                    f.read_to_end(&mut buf).await.map_err(io_err)?;
+                }
+            }
+            Ok(buf)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FileSystemFileWriter for LocalFileWriter {
+        async fn length(&self) -> NdnResult<u64> {
+            tokio::fs::metadata(self.path.as_path())
+                .await
+                .map(|meta| meta.len())
+                .map_err(|e| NdnError::IoError(e.to_string()))
+        }
+
+        async fn write_chunk(&self, chunk_data: &[u8], offset: SeekFrom) -> NdnResult<()> {
+            let file = self.file.clone();
+            let data = chunk_data.to_vec();
+            let mut f = file.lock().await;
+            f.seek(offset).await.map_err(io_err)?;
+            f.write_all(&data).await.map_err(io_err)
+        }
+
+        async fn truncate(&self, offset: SeekFrom) -> NdnResult<()> {
+            let mut f = self.file.lock().await;
+            let len = match offset {
+                SeekFrom::Start(pos) => pos,
+                SeekFrom::Current(pos) => {
+                    let current_pos = f.seek(SeekFrom::Current(0)).await.map_err(io_err)?;
+                    if pos < 0 {
+                        return Err(NdnError::InvalidData(
+                            "negative offset not allowed in truncate".into(),
+                        ));
+                    }
+                    (current_pos as i64 + pos) as u64
+                }
+                SeekFrom::End(pos) => {
+                    let current_pos = f.seek(SeekFrom::End(0)).await.map_err(io_err)?;
+                    if pos > 0 {
+                        return Err(NdnError::InvalidData(
+                            "positive offset not allowed in truncate".into(),
+                        ));
+                    }
+                    (current_pos as i64 + pos) as u64
+                }
+            };
+            f.set_len(len).await.map_err(io_err)
+        }
+
+        async fn read_chunk(&self, offset: SeekFrom, limit: u64) -> NdnResult<Vec<u8>> {
+            let mut f = self.file.lock().await;
+            f.seek(offset).await.map_err(io_err)?;
+            let mut buf = vec![0; limit as usize];
+            let n = f.read(&mut buf).await.map_err(io_err)?;
+            buf.truncate(n);
+            Ok(buf)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FileSystemReader<LocalDirReader, LocalFileReader> for LocalFsReader {
+        async fn info(&self, path: &Path) -> NdnResult<FileSystemItem> {
+            let meta = tokio::fs::metadata(path).await.map_err(io_err)?;
+            let name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| NdnError::InvalidData("invalid unicode name".into()))?
+                .to_string();
+
+            if meta.is_dir() {
+                Ok(FileSystemItem::Dir(DirObject {
+                    name,
+                    content: String::new(),
+                    exp: 0,
+                    meta: None,
+                    owner: None,
+                    create_time: None,
+                    extra_info: HashMap::new(),
+                }))
+            } else if meta.is_file() {
+                Ok(FileSystemItem::File(FileObject::new(
+                    name,
+                    meta.len(),
+                    String::new(),
+                )))
+            } else {
+                Err(NdnError::InvalidData("unsupported fs entry type".into()))
+            }
+        }
+
+        async fn open_dir(&self, path: &Path) -> NdnResult<LocalDirReader> {
+            let dir_reader = tokio::fs::read_dir(path).await.map_err(io_err)?;
+
+            Ok(LocalDirReader {
+                reader: Arc::new(Mutex::new(dir_reader)),
+            })
+        }
+
+        async fn open_file(&self, path: &Path) -> NdnResult<LocalFileReader> {
+            let file = tokio::fs::File::open(path).await.map_err(io_err)?;
+
+            Ok(LocalFileReader {
+                path: path.to_path_buf(),
+                file: Arc::new(Mutex::new(file)),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FileSystemWriter<LocalFileWriter> for LocalFsWriter {
+        async fn create_dir_all(&self, dir_path: &Path) -> NdnResult<()> {
+            tokio::fs::create_dir_all(dir_path).await.map_err(io_err)
+        }
+
+        async fn create_dir(&self, dir: &DirObject, parent_path: &Path) -> NdnResult<()> {
+            let dir_path = parent_path.join(&dir.name);
+            tokio::fs::create_dir(&dir_path).await.map_err(io_err)?;
+
+            // Optionally, you can write metadata or other info to the directory
+            // For now, we just create the directory
+            Ok(())
+        }
+
+        async fn open_file(&self, file_path: &Path) -> NdnResult<LocalFileWriter> {
+            let file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .read(true)
+                .create(true)
+                .open(file_path)
+                .await
+                .map_err(io_err)?;
+
+            Ok(LocalFileWriter {
+                path: file_path.to_path_buf(),
+                file: Arc::new(Mutex::new(file)),
+            })
+        }
+    }
+
+    // Provide Default implementations if upstream expects Default
+    impl Default for LocalFsReader {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+    impl Default for LocalFsWriter {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    // 维护一个push_chunk的队列，每1ms写入一个chunk到NamedDataMgr
+    struct WriteChunkOperation {
+        chunk_id: ChunkId,
+        file_path: PathBuf,
+        offset: SeekFrom,
+        chunk_size: u64,
+        chunk_data: Option<Vec<u8>>,
+    }
+
+    #[derive(Clone)]
+    pub struct MgrNdnWriter {
+        ndn_mgr_id: String,
+        push_chunk_queue: Arc<Mutex<VecDeque<WriteChunkOperation>>>,
+    }
+
+    #[derive(Clone)]
+    pub struct MgrNdnReader {
+        ndn_mgr_id: String,
+    }
+
+    impl MgrNdnWriter {
+        pub fn new(ndn_mgr_id: String) -> Self {
+            Self {
+                ndn_mgr_id,
+                push_chunk_queue: Arc::new(Mutex::new(VecDeque::new())),
+            }
+        }
+
+        pub async fn start_writer_loop(&self) {
+            let queue = self.push_chunk_queue.clone();
+            let ndn_mgr_id = self.ndn_mgr_id.clone();
+            tokio::spawn(async move {
+                loop {
+                    // Wait for 1ms before processing the next chunk
+                    tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+
+                    let mut queue_lock = queue.lock().await;
+                    if let Some(op) = queue_lock.pop_front() {
+                        if let Err(e) = Self::process_chunk(&ndn_mgr_id, op).await {
+                            error!("Failed to process chunk: {}", e);
+                        }
+                    }
+                }
+            });
+        }
+
+        async fn read_file_range(
+            file_path: &Path,
+            offset: SeekFrom,
+            size: u64,
+        ) -> NdnResult<Vec<u8>> {
+            let mut file = tokio::fs::File::open(file_path)
+                .await
+                .map_err(|e| NdnError::IoError(e.to_string()))?;
+            file.seek(offset)
+                .await
+                .map_err(|e| NdnError::IoError(e.to_string()))?;
+            let mut buf = vec![0u8; size as usize];
+            let n = file
+                .read(&mut buf)
+                .await
+                .map_err(|e| NdnError::IoError(e.to_string()))?;
+            buf.truncate(n);
+            Ok(buf)
+        }
+
+        async fn process_chunk(ndn_mgr_id: &str, op: WriteChunkOperation) -> NdnResult<()> {
+            let mut chunk_from_file = Vec::new();
+            let data = match op.chunk_data.as_ref() {
+                Some(d) => d,
+                None => {
+                    chunk_from_file =
+                        Self::read_file_range(&op.file_path, op.offset, op.chunk_size).await?;
+                    &chunk_from_file
+                }
+            };
+
+            // Try store to NamedDataMgr (best-effort). We ignore "already exists" style errors.
+            // These method names are assumed; adjust to real NamedDataMgr API if different.
+            let (mut writer, _) = NamedDataMgr::open_chunk_writer(
+                Some(ndn_mgr_id),
+                &op.chunk_id,
+                data.len() as u64,
+                0,
+            )
+            .await?;
+            writer.write_all(data.as_slice()).await.map_err(|e| {
+                NdnError::IoError(format!("Failed to write chunk {:?}: {}", op.chunk_id, e))
+            })?;
+            Ok(())
+        }
+    }
+
+    impl MgrNdnReader {
+        pub fn new(ndn_mgr_id: String) -> Self {
+            Self { ndn_mgr_id }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl super::dir_backup::NdnWriter for MgrNdnWriter {
+        async fn push_chunk(
+            &self,
+            chunk_id: &ChunkId,
+            file_path: &Path,
+            offset: SeekFrom,
+            chunk_size: u64,
+            chunk_data: Option<Vec<u8>>,
+        ) -> NdnResult<()> {
+            let op = WriteChunkOperation {
+                chunk_id: chunk_id.clone(),
+                file_path: file_path.to_path_buf(),
+                offset,
+                chunk_size,
+                chunk_data,
+            };
+            let mut queue_lock = self.push_chunk_queue.lock().await;
+            queue_lock.push_back(op);
+
+            Ok(())
+        }
+
+        async fn ignore(&self, obj_id: &ObjId) -> NdnResult<()> {
+            // remove chunk from write queue.
+            let mut queue_lock = self.push_chunk_queue.lock().await;
+            queue_lock.retain(|op| &op.chunk_id.to_obj_id() != obj_id);
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl super::dir_backup::NdnReader for MgrNdnReader {
+        async fn get_chunk(&self, chunk_id: &ChunkId) -> NdnResult<Vec<u8>> {
+            let (mut reader, _) = NamedDataMgr::open_chunk_reader(
+                Some(self.ndn_mgr_id.as_str()),
+                chunk_id,
+                SeekFrom::Start(0),
+                false,
+            )
+            .await
+            .map_err(|e| {
+                NdnError::IoError(format!("Failed to open chunk {:?}: {}", chunk_id, e))
+            })?;
+            let mut buf = Vec::new();
+            reader.read_to_end(&mut buf).await.map_err(|e| {
+                NdnError::IoError(format!("Failed to read chunk {:?}: {}", chunk_id, e))
+            })?;
+            Ok(buf)
+        }
+    }
+
+    /**
+     * 使用file_system_to_ndn把本地文件系统中的一个目录备份到ndn服务
+     * 1. 启动一个packed_obj_pipeline
+     * 2. 启动一个从packed_obj_pipeline读取的任务
+     * 3. 启动一个任务使用file_system_to_ndn把本地文件系统中的一个目录备份到ndn服务
+     * 4. 等待任务完成
+     * 5. 退出进程
+     */
+    struct DummyReaderListener {
+        finished: bool,
+    }
+    #[async_trait::async_trait]
+    impl ReaderListener for DummyReaderListener {
+        async fn wait(&mut self) -> NdnResult<ReaderEvent> {
+            if self.finished {
+                Ok(ReaderEvent::End(EndReason::Complete))
+            } else {
+                self.finished = true;
+                Ok(ReaderEvent::End(EndReason::Complete))
+            }
+        }
+    }
+
+    pub async fn run_backup_demo(scan_path: impl AsRef<Path>) -> NdnResult<()> {
+        // 1. 启动一个 packed_obj_pipeline
+        let (mut pipeline_writer, mut pipeline_reader, writer_feedback, _unused_listener) =
+            pipeline_sim::new_pipeline_sim();
+
+        // 使用自定义的 DummyReaderListener 以避免未实现的 wait()
+        let mut pipeline_reader_listener = DummyReaderListener { finished: false };
+
+        // 2. 启动一个从 packed_obj_pipeline 读取的任务 (仅打印输出)
+        let reader_task: JoinHandle<()> = tokio::spawn(async move {
+            loop {
+                match pipeline_reader.next_line().await {
+                    Ok(Some((line, rel_idx))) => {
+                        info!("pipeline read line: {:?} @ {:?}", line, rel_idx);
+                        // 这里可以处理读取到的行，比如打印或存储
+
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        info!("pipeline reader end: {}", e);
+                        break;
+                    }
+                }
+            }
+        });
+
+        // 准备本地文件系统读写实现与存储
+        let fs_reader = super::backup_app::LocalFsReader::new();
+        let storage_path = {
+            let mut p = std::env::temp_dir();
+            p.push("backup_demo.sqlite");
+            p
+        };
+        let storage = super::backup_app::SqliteStorage::open(&storage_path).await?;
+
+        // NDN 写入器
+        let ndn_writer = super::backup_app::MgrNdnWriter::new("demo-ndn-mgr".to_string());
+        ndn_writer.start_writer_loop().await;
+
+        // 3. 启动备份任务 (file_system_to_ndn)
+        let root_id = file_system_to_ndn(
+            Some(scan_path.as_ref()),
+            ndn_writer.clone(),
+            pipeline_writer,
+            fs_reader.clone(),
+            storage.clone(),
+            1024 * 256, // chunk size
+        )
+        .await?;
+
+        info!("backup completed, root item id in storage: {:?}", root_id);
+
+        // 4. 通知结束
+        loop {
+            let event = pipeline_reader_listener.wait().await?;
+            match event {
+                ReaderEvent::End(reason) => {
+                    info!("Pipeline reader ended with reason: {:?}", reason);
+                    break;
+                }
+                ReaderEvent::NeedLine(items) => todo!(),
+                ReaderEvent::NeedObject(items) => todo!(),
+                ReaderEvent::IgnoreLine(items) => {
+                    let items = storage.get_items_by_line_index(items.as_slice()).await?;
+                    for item in items {
+                        if let Some(obj_id) = item.status.get_obj_id() {
+                            info!("Ignoring object: {:?}", obj_id);
+                            ndn_writer.ignore(obj_id).await?;
+                        }
+                    }
+                }
+                ReaderEvent::IgnoreObject(obj_ids) => {
+                    for obj_id in obj_ids {
+                        ndn_writer.ignore(&obj_id).await?;
+                    }
+                }
+            }
+        }
+
+        // 5. 等待读取任务结束
+        let _ = reader_task.await;
+
+        Ok(())
     }
 }
